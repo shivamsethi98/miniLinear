@@ -1,0 +1,2 @@
+// EXPECT: parse error
+let let let

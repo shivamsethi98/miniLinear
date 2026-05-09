@@ -6,3 +6,7 @@ edition = "2021"
 [lib]
 name = "mini_linear"
 path = "src/lib.rs"
+
+[[bin]]
+name = "mini_linear"
+path = "src/main.rs"
