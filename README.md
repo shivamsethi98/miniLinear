@@ -26,7 +26,3 @@ cargo test
 ```
 
 Runs unit tests in `src/` plus the accept/reject corpus under `tests/`.
-
-## Status
-
-This is Phase 0: integer literals, addition, `let ordinary` bindings, and parenthesised grouping. Linearity, borrowing, methods, and algebraic datatypes are intentionally absent from the parser and type checker (though their AST nodes already exist) and arrive in Phases 1–4.
