@@ -1,9 +1,22 @@
-//! Hand-rolled recursive-descent parser. Phases 0 + 1.
+//! Hand-rolled recursive-descent parser. Phases 0 + 1 + 2 + 3.
 //!
 //! Grammar:
 //!
 //! ```text
-//! program    ::= expr
+//! program       ::= decl* expr
+//! decl          ::= method_decl
+//! method_decl   ::= 'method' ident '(' params? ')' 'returns' '(' params? ')' '{' expr '}'
+//! params        ::= param (',' param)*
+//! param         ::= usage ('inout')? ident ':' type
+//!                   (parser rejects `inout` on non-linear params and on
+//!                    return params; type checker rejects `shared` returns)
+//!
+//! type          ::= 'int' | tuple_type
+//! tuple_type    ::= '(' (tuple_field (',' tuple_field)*)? ')'
+//!                   (zero fields = empty tuple `()`; one field is a parse
+//!                    error since the language has no 1-tuples)
+//! tuple_field   ::= [usage] type        (usage defaults to `ordinary`)
+//!
 //! expr       ::= seq_expr
 //! seq_expr   ::= seq_atom (';' seq_atom)*
 //! seq_atom   ::= 'let' usage ident '=' expr 'in' expr
@@ -12,12 +25,13 @@
 //! add_expr   ::= postfix ('+' postfix)*
 //! postfix    ::= atom ('.' nonneg_int)*
 //! atom       ::= int_literal
-//!              | ident
+//!              | ident                                 (variable reference)
+//!              | ident '(' (expr (',' expr)*)? ')'     (method call)
 //!              | '(' paren_body ')'
 //! paren_body ::= /* empty */                  // empty tuple
 //!              | expr                          // grouping (no comma)
 //!              | expr (',' expr)+              // tuple with ≥ 2 elements
-//! usage      ::= 'ordinary' | 'linear'
+//! usage      ::= 'ordinary' | 'linear' | 'shared'
 //! ```
 //!
 //! Precedence (high → low): tuple projection `e.i`, addition `+`,
@@ -25,25 +39,44 @@
 //! because the let body is parsed via `expr`). Both `+` and `;` are
 //! left-associative.
 //!
+//! Method calls live at the `atom` level rather than at `postfix`: only
+//! bare names can be called, never the result of an arbitrary expression.
+//! `f(x).0` is fine (project from a call result); `f(x).0(y)` is not (the
+//! second `(...)` doesn't bind to anything because postfix only handles
+//! `.i`).
+//!
 //! Future operators (subtraction, comparisons, etc.) will need additional
 //! precedence layers between `expr` and `atom`.
 //!
 //! Comments (`// ...`) and ASCII whitespace are skipped between tokens.
-//! Reserved keywords (`shared`, `method`, `returns`, `enum`, `match`,
-//! `inout`, `int`) are recognised by the lexer and rejected by the parser
-//! so e.g. `let shared x = ...` is a parse error rather than parsing
-//! `shared` as a variable.
+//! Reserved keywords are recognised by the lexer (see `RESERVED`) and
+//! rejected as binders / variables anywhere they would otherwise look like
+//! identifiers.
 
-use crate::ast::{Expr, Program, Span, Usage};
+use crate::ast::{
+    Decl, Expr, MethodDecl, Param, Program, Span, TupleField, Type, Usage,
+};
 use crate::error::{Error, ErrorCategory};
 
-/// Parse a complete program from `source`. The Phase 0/1 program is a
-/// single expression; later phases will accept a list of declarations
-/// followed by a top-level expression.
+/// Parse a complete program from `source`: zero or more top-level method
+/// declarations, followed by a single main expression.
 pub fn parse(source: &str) -> Result<Program, Error> {
     let mut p = Parser::new(source);
     p.skip_trivia();
     let start = p.pos;
+
+    let mut decls = Vec::new();
+    loop {
+        p.skip_trivia();
+        if let Some(method_span) = p.try_keyword("method") {
+            let decl = p.parse_method_decl_tail(method_span)?;
+            decls.push(Decl::Method(decl));
+        } else {
+            break;
+        }
+    }
+
+    p.skip_trivia();
     let main_expr = p.parse_expr()?;
     p.skip_trivia();
     if !p.at_eof() {
@@ -51,7 +84,7 @@ pub fn parse(source: &str) -> Result<Program, Error> {
     }
     let span = Span::new(start, p.pos);
     Ok(Program {
-        decls: Vec::new(),
+        decls,
         main_expr,
         span,
     })
@@ -471,23 +504,71 @@ impl<'src> Parser<'src> {
             return self.parse_paren_body(open_span);
         }
 
-        // Identifier or reserved keyword.
+        // Identifier — either a variable reference or a method call.
         let saved = self.pos;
-        if let Some((text, span)) = self.lex_ident() {
+        if let Some((text, ident_span)) = self.lex_ident() {
             if is_reserved(text) {
                 self.pos = saved;
                 return Err(self.error_at(
-                    span,
+                    ident_span,
                     format!("`{text}` is a reserved keyword and cannot appear here"),
                 ));
             }
+            let name = text.to_string();
+            // Method call: identifier immediately (modulo trivia) followed
+            // by `(`. Trivia between the name and `(` is allowed,
+            // consistent with our trivia-anywhere policy.
+            self.skip_trivia();
+            if self.peek() == Some(b'(') {
+                return self.parse_method_call_tail(name, ident_span);
+            }
             return Ok(Expr::Var {
-                name: text.to_string(),
-                span,
+                name,
+                span: ident_span,
             });
         }
 
         Err(self.error_here("expected expression"))
+    }
+
+    /// Parse the `(args)` tail of a method call. Caller has consumed the
+    /// method name and any trivia; current position is at the opening `(`.
+    fn parse_method_call_tail(
+        &mut self,
+        name: String,
+        name_span: Span,
+    ) -> Result<Expr, Error> {
+        self.try_byte(b'(').expect("caller verified opening paren");
+
+        self.skip_trivia();
+        let mut args = Vec::new();
+        if self.peek() != Some(b')') {
+            args.push(self.parse_expr()?);
+            loop {
+                self.skip_trivia();
+                if self.try_byte(b',').is_none() {
+                    break;
+                }
+                self.skip_trivia();
+                if self.peek() == Some(b')') {
+                    return Err(
+                        self.error_here("trailing commas in argument lists are not supported")
+                    );
+                }
+                args.push(self.parse_expr()?);
+            }
+        }
+        self.skip_trivia();
+        let close_span = self
+            .try_byte(b')')
+            .ok_or_else(|| self.error_here("expected `)` to close argument list"))?;
+        let span = name_span.join(close_span);
+        Ok(Expr::MethodCall {
+            name,
+            name_span,
+            args,
+            span,
+        })
     }
 
     /// After consuming `(`, decide between empty tuple, grouping, or
@@ -559,6 +640,227 @@ impl<'src> Parser<'src> {
             }
             None => Err(self.error_here("expected identifier")),
         }
+    }
+
+    // -- Method declarations --
+
+    /// Parse the rest of a method declaration after the `method` keyword.
+    /// Caller has consumed `method`; we parse name through closing `}`.
+    fn parse_method_decl_tail(&mut self, method_span: Span) -> Result<MethodDecl, Error> {
+        self.skip_trivia();
+        let (name, name_span) = self.parse_binder()?;
+
+        self.skip_trivia();
+        self.try_byte(b'(')
+            .ok_or_else(|| self.error_here("expected `(` after method name"))?;
+        let params = self.parse_params(false)?;
+        self.try_byte(b')')
+            .ok_or_else(|| self.error_here("expected `)` to close parameter list"))?;
+
+        self.skip_trivia();
+        self.try_keyword("returns")
+            .ok_or_else(|| self.error_here("expected `returns` after parameter list"))?;
+
+        self.skip_trivia();
+        self.try_byte(b'(')
+            .ok_or_else(|| self.error_here("expected `(` after `returns`"))?;
+        let returns = self.parse_params(true)?;
+        self.try_byte(b')')
+            .ok_or_else(|| self.error_here("expected `)` to close return list"))?;
+
+        self.skip_trivia();
+        self.try_byte(b'{')
+            .ok_or_else(|| self.error_here("expected `{` to begin method body"))?;
+
+        self.skip_trivia();
+        let body = self.parse_expr()?;
+
+        self.skip_trivia();
+        let close_span = self
+            .try_byte(b'}')
+            .ok_or_else(|| self.error_here("expected `}` to close method body"))?;
+        let span = method_span.join(close_span);
+        Ok(MethodDecl {
+            name,
+            name_span,
+            params,
+            returns,
+            body,
+            span,
+        })
+    }
+
+    /// Parse a comma-separated list of parameters inside `(...)`. Caller
+    /// has consumed the opening paren and is responsible for consuming the
+    /// closing paren. `is_return` swaps `inout`'s legality (allowed only
+    /// in non-return position).
+    fn parse_params(&mut self, is_return: bool) -> Result<Vec<Param>, Error> {
+        let mut params = Vec::new();
+        self.skip_trivia();
+        if self.peek() == Some(b')') {
+            return Ok(params);
+        }
+        params.push(self.parse_one_param(is_return)?);
+        loop {
+            self.skip_trivia();
+            if self.try_byte(b',').is_none() {
+                break;
+            }
+            self.skip_trivia();
+            if self.peek() == Some(b')') {
+                return Err(
+                    self.error_here("trailing commas in parameter lists are not supported")
+                );
+            }
+            params.push(self.parse_one_param(is_return)?);
+        }
+        self.skip_trivia();
+        Ok(params)
+    }
+
+    fn parse_one_param(&mut self, is_return: bool) -> Result<Param, Error> {
+        self.skip_trivia();
+        let param_start = self.pos;
+
+        // Usage keyword (required). Detect "inout-without-usage" and emit
+        // a targeted error.
+        let usage = if self.try_keyword("ordinary").is_some() {
+            Usage::Ordinary
+        } else if self.try_keyword("linear").is_some() {
+            Usage::Linear
+        } else if self.try_keyword("shared").is_some() {
+            Usage::Shared
+        } else {
+            // Specific case: the user wrote `inout x: T` without a usage.
+            let saved = self.pos;
+            if let Some((text, span)) = self.lex_ident() {
+                self.pos = saved;
+                if text == "inout" {
+                    return Err(self.error_at(
+                        span,
+                        "expected usage keyword (`linear`, `shared`, or `ordinary`) before `inout`",
+                    ));
+                }
+                return Err(self.error_at(
+                    span,
+                    format!("expected usage keyword for parameter, found `{text}`"),
+                ));
+            }
+            return Err(self.error_here("expected usage keyword for parameter"));
+        };
+
+        // Optional `inout`.
+        self.skip_trivia();
+        let inout = if let Some(inout_span) = self.try_keyword("inout") {
+            if is_return {
+                return Err(self.error_at(
+                    inout_span,
+                    "`inout` is not allowed in return parameters",
+                ));
+            }
+            if usage != Usage::Linear {
+                return Err(self.error_at(
+                    inout_span,
+                    "`inout` is only valid on `linear` parameters",
+                ));
+            }
+            true
+        } else {
+            false
+        };
+
+        self.skip_trivia();
+        let (name, name_span) = self.parse_binder()?;
+
+        self.skip_trivia();
+        self.try_byte(b':')
+            .ok_or_else(|| self.error_here("expected `:` after parameter name"))?;
+
+        self.skip_trivia();
+        let ty = self.parse_type()?;
+
+        let span = Span::new(param_start, self.pos);
+        Ok(Param {
+            usage,
+            inout,
+            name,
+            name_span,
+            ty,
+            span,
+        })
+    }
+
+    // -- Type syntax --
+
+    /// `type ::= 'int' | tuple_type`.
+    fn parse_type(&mut self) -> Result<Type, Error> {
+        self.skip_trivia();
+        if self.try_keyword("int").is_some() {
+            return Ok(Type::Int);
+        }
+        if let Some(open_span) = self.try_byte(b'(') {
+            return self.parse_tuple_type_body(open_span);
+        }
+        Err(self.error_here("expected type (`int` or a tuple type)"))
+    }
+
+    /// After consuming `(`, parse the body of a tuple type. Empty `()` is
+    /// the empty tuple type; one field is rejected (no 1-tuples in the
+    /// language); two or more fields produce a tuple type with each
+    /// field's usage defaulting to `ordinary` if omitted.
+    fn parse_tuple_type_body(&mut self, open_span: Span) -> Result<Type, Error> {
+        self.skip_trivia();
+        if self.try_byte(b')').is_some() {
+            return Ok(Type::Tuple(Vec::new()));
+        }
+        let mut fields = Vec::new();
+        fields.push(self.parse_tuple_type_field()?);
+        loop {
+            self.skip_trivia();
+            if self.try_byte(b',').is_none() {
+                break;
+            }
+            self.skip_trivia();
+            if self.peek() == Some(b')') {
+                return Err(
+                    self.error_here("trailing commas in tuple types are not supported")
+                );
+            }
+            fields.push(self.parse_tuple_type_field()?);
+        }
+        self.skip_trivia();
+        let close_span = self
+            .try_byte(b')')
+            .ok_or_else(|| self.error_here("expected `)` to close tuple type"))?;
+        if fields.len() == 1 {
+            let pattern_span = open_span.join(close_span);
+            return Err(self.error_at(
+                pattern_span,
+                "1-element tuple types are not supported (no 1-tuples in the language)",
+            ));
+        }
+        Ok(Type::Tuple(fields))
+    }
+
+    /// One field of a tuple type. Usage is optional — defaults to
+    /// `ordinary` when omitted, matching the spirit of "annotations should
+    /// be optional when the natural default is unambiguous." Forms like
+    /// `(linear int, ordinary int)` (explicit) and `(int, int)` (defaults)
+    /// both parse.
+    fn parse_tuple_type_field(&mut self) -> Result<TupleField, Error> {
+        self.skip_trivia();
+        let usage = if self.try_keyword("ordinary").is_some() {
+            Usage::Ordinary
+        } else if self.try_keyword("linear").is_some() {
+            Usage::Linear
+        } else if self.try_keyword("shared").is_some() {
+            Usage::Shared
+        } else {
+            Usage::Ordinary
+        };
+        self.skip_trivia();
+        let ty = self.parse_type()?;
+        Ok(TupleField { usage, ty })
     }
 }
 
@@ -904,5 +1206,227 @@ mod tests {
         };
         assert!(matches!(*first, Expr::IntLit { value: 1, .. }));
         assert!(matches!(*second, Expr::Let { .. }));
+    }
+
+    // -- Phase 3: methods --
+
+    fn parse_program(src: &str) -> Program {
+        parse(src).expect("parse failed")
+    }
+
+    fn parse_program_err(src: &str) -> Error {
+        parse(src).expect_err("expected parse failure")
+    }
+
+    #[test]
+    fn method_decl_simple() {
+        let prog = parse_program(
+            "method add(ordinary x: int, ordinary y: int) returns (ordinary r: int) { x + y } 1",
+        );
+        assert_eq!(prog.decls.len(), 1);
+        let Decl::Method(m) = &prog.decls[0] else {
+            panic!("expected Method decl");
+        };
+        assert_eq!(m.name, "add");
+        assert_eq!(m.params.len(), 2);
+        assert_eq!(m.params[0].name, "x");
+        assert_eq!(m.params[0].usage, Usage::Ordinary);
+        assert!(!m.params[0].inout);
+        assert_eq!(m.returns.len(), 1);
+        assert_eq!(m.returns[0].name, "r");
+    }
+
+    #[test]
+    fn method_decl_with_inout() {
+        let prog = parse_program(
+            "method swap(linear inout a: (int, int), linear inout b: (int, int)) returns () { (b, a) } 1",
+        );
+        let Decl::Method(m) = &prog.decls[0] else {
+            panic!("expected Method decl");
+        };
+        assert_eq!(m.params.len(), 2);
+        assert!(m.params[0].inout);
+        assert_eq!(m.params[0].usage, Usage::Linear);
+        assert_eq!(m.returns.len(), 0);
+    }
+
+    #[test]
+    fn method_decl_no_params_no_returns() {
+        let prog = parse_program("method nop() returns () { () } nop()");
+        let Decl::Method(m) = &prog.decls[0] else {
+            panic!("expected Method decl");
+        };
+        assert_eq!(m.params.len(), 0);
+        assert_eq!(m.returns.len(), 0);
+    }
+
+    #[test]
+    fn method_call_at_top_level() {
+        let prog = parse_program("method id(ordinary x: int) returns (ordinary r: int) { x } id(5)");
+        match prog.main_expr {
+            Expr::MethodCall { name, args, .. } => {
+                assert_eq!(name, "id");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected MethodCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn method_call_zero_args() {
+        let prog = parse_program("method nop() returns () { () } nop()");
+        match prog.main_expr {
+            Expr::MethodCall { args, .. } => assert_eq!(args.len(), 0),
+            other => panic!("expected MethodCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn method_call_with_whitespace_before_paren() {
+        // `id (5)` with a space between name and `(` should still parse as
+        // a method call, consistent with our trivia-anywhere policy.
+        let prog =
+            parse_program("method id(ordinary x: int) returns (ordinary r: int) { x } id (5)");
+        assert!(matches!(prog.main_expr, Expr::MethodCall { .. }));
+    }
+
+    #[test]
+    fn bare_ident_remains_var() {
+        // `foo` without parens is a Var, not a call.
+        let prog = parse_program("foo");
+        assert!(matches!(prog.main_expr, Expr::Var { .. }));
+    }
+
+    #[test]
+    fn rejects_inout_on_ordinary_param() {
+        let err = parse_program_err(
+            "method bad(ordinary inout x: int) returns () { () } 1",
+        );
+        assert_eq!(err.category, ErrorCategory::ParseError);
+        let note = err.note.expect("note");
+        assert!(note.contains("`inout` is only valid on `linear`"), "got: {note}");
+    }
+
+    #[test]
+    fn rejects_inout_on_shared_param() {
+        let err = parse_program_err(
+            "method bad(shared inout x: int) returns () { () } 1",
+        );
+        assert_eq!(err.category, ErrorCategory::ParseError);
+        assert!(err.note.unwrap().contains("`inout` is only valid on `linear`"));
+    }
+
+    #[test]
+    fn rejects_inout_in_returns() {
+        let err = parse_program_err(
+            "method bad() returns (linear inout x: int) { x } 1",
+        );
+        assert_eq!(err.category, ErrorCategory::ParseError);
+        assert!(err.note.unwrap().contains("`inout` is not allowed in return"));
+    }
+
+    #[test]
+    fn rejects_inout_without_usage() {
+        let err = parse_program_err(
+            "method bad(inout x: int) returns () { () } 1",
+        );
+        assert_eq!(err.category, ErrorCategory::ParseError);
+        let note = err.note.unwrap();
+        assert!(
+            note.contains("usage keyword") && note.contains("inout"),
+            "got: {note}",
+        );
+    }
+
+    #[test]
+    fn type_int() {
+        // Round-trip through a method decl to exercise parse_type.
+        let prog = parse_program("method m(ordinary x: int) returns () { () } 1");
+        let Decl::Method(m) = &prog.decls[0] else {
+            panic!("expected Method decl");
+        };
+        assert_eq!(m.params[0].ty, Type::Int);
+    }
+
+    #[test]
+    fn type_empty_tuple() {
+        let prog = parse_program("method m(ordinary x: ()) returns () { () } 1");
+        let Decl::Method(m) = &prog.decls[0] else {
+            panic!("expected Method decl");
+        };
+        assert_eq!(m.params[0].ty, Type::Tuple(Vec::new()));
+    }
+
+    #[test]
+    fn type_tuple_with_implicit_ordinary() {
+        // `(int, int)` should parse as `Tuple([{Ordinary, Int}, {Ordinary, Int}])`.
+        let prog = parse_program("method m(ordinary x: (int, int)) returns () { () } 1");
+        let Decl::Method(m) = &prog.decls[0] else {
+            panic!("expected Method decl");
+        };
+        if let Type::Tuple(fields) = &m.params[0].ty {
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].usage, Usage::Ordinary);
+            assert_eq!(fields[0].ty, Type::Int);
+            assert_eq!(fields[1].usage, Usage::Ordinary);
+        } else {
+            panic!("expected Tuple");
+        }
+    }
+
+    #[test]
+    fn type_tuple_with_explicit_usage() {
+        let prog = parse_program(
+            "method m(linear x: (linear int, ordinary int)) returns () { () } 1",
+        );
+        let Decl::Method(m) = &prog.decls[0] else {
+            panic!("expected Method decl");
+        };
+        if let Type::Tuple(fields) = &m.params[0].ty {
+            assert_eq!(fields[0].usage, Usage::Linear);
+            assert_eq!(fields[1].usage, Usage::Ordinary);
+        } else {
+            panic!("expected Tuple");
+        }
+    }
+
+    #[test]
+    fn type_one_tuple_is_parse_error() {
+        let err = parse_program_err(
+            "method m(ordinary x: (int)) returns () { () } 1",
+        );
+        assert_eq!(err.category, ErrorCategory::ParseError);
+        assert!(err.note.unwrap().contains("1-element"));
+    }
+
+    #[test]
+    fn multiple_decls() {
+        let prog = parse_program(
+            "method first() returns (ordinary r: int) { 1 } \
+             method second() returns (ordinary r: int) { 2 } \
+             first()",
+        );
+        assert_eq!(prog.decls.len(), 2);
+    }
+
+    #[test]
+    fn no_decls_still_works() {
+        // Phase 0-2 backward compat: programs with no decls parse the same
+        // as before.
+        let prog = parse_program("1 + 1");
+        assert!(prog.decls.is_empty());
+        assert!(matches!(prog.main_expr, Expr::Add { .. }));
+    }
+
+    #[test]
+    fn missing_main_expr_is_parse_error() {
+        let err = parse_program_err("method nop() returns () { () }");
+        assert_eq!(err.category, ErrorCategory::ParseError);
+    }
+
+    #[test]
+    fn rejects_reserved_method_name() {
+        let err = parse_program_err("method let() returns () { () } 1");
+        assert_eq!(err.category, ErrorCategory::ParseError);
     }
 }

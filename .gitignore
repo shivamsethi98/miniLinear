@@ -1,5 +1,5 @@
 Cargo.lock
 target/
 .claude
-phase*.md
 formal_paper.txt
+phase*_handoff.md
