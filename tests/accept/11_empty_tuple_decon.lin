@@ -1,0 +1,1 @@
+let linear u = () in let () = u in 5

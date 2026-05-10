@@ -1,0 +1,2 @@
+// EXPECT: type error
+let linear t = (1, 2) in 5

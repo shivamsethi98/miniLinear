@@ -1,2 +1,0 @@
-// EXPECT: parse error
-let linear x = 1 in x + 1

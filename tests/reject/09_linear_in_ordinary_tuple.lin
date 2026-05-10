@@ -1,0 +1,2 @@
+// EXPECT: type error
+let linear t = (1, 2) in let ordinary outer = (t, 3) in 5

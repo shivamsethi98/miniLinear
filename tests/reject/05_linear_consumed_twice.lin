@@ -1,0 +1,5 @@
+// EXPECT: type error
+let linear t = (1, 2) in
+  let (a, b) = t in
+    let (c, d) = t in
+      a + b + c + d

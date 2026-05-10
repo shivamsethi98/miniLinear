@@ -1,0 +1,1 @@
+let ordinary t = (1, 2) in t.0 + t.1

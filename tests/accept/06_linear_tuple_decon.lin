@@ -1,0 +1,1 @@
+let linear t = (1, 2) in let (a, b) = t in a + b

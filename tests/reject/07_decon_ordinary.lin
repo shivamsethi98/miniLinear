@@ -1,0 +1,2 @@
+// EXPECT: type error
+let ordinary t = (1, 2) in let (a, b) = t in a + b
