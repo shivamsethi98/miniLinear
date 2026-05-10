@@ -1,0 +1,5 @@
+let linear inner = (1, 2) in
+  let linear outer = (inner, 3) in
+    (outer.1 + outer.1) ;
+    let (i, x) = outer in
+      let (a, b) = i in a + b + x

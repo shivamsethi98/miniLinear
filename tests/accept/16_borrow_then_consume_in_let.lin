@@ -1,0 +1,3 @@
+let linear y = (1, 2) in
+  let ordinary tmp = ((y.0 + y.1) ; 7) in
+    let (a, b) = y in a + b + tmp

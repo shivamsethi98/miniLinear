@@ -304,6 +304,8 @@ impl<'src> Parser<'src> {
             Usage::Ordinary
         } else if self.try_keyword("linear").is_some() {
             Usage::Linear
+        } else if self.try_keyword("shared").is_some() {
+            Usage::Shared
         } else {
             // Peek at the offender for a targeted error.
             let saved = self.pos;
@@ -311,19 +313,14 @@ impl<'src> Parser<'src> {
                 Some(found) => found,
                 None => {
                     self.pos = saved;
-                    return Err(
-                        self.error_here("expected `ordinary`, `linear`, or `(` after `let`")
-                    );
+                    return Err(self.error_here(
+                        "expected `ordinary`, `linear`, `shared`, or `(` after `let`",
+                    ));
                 }
             };
-            let msg = match kw_text {
-                "shared" => {
-                    "`shared` will be supported in Phase 2 alongside borrowing".to_string()
-                }
-                _ => format!(
-                    "expected `ordinary`, `linear`, or `(` after `let`, found `{kw_text}`"
-                ),
-            };
+            let msg = format!(
+                "expected `ordinary`, `linear`, `shared`, or `(` after `let`, found `{kw_text}`"
+            );
             return Err(self.error_at(kw_span, msg));
         };
 
@@ -722,14 +719,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_shared_let_with_phase2_message() {
-        let err = parse_err("let shared x = 1 in x");
-        assert_eq!(err.category, ErrorCategory::ParseError);
-        let note = err.note.expect("expected a note");
-        assert!(
-            note.contains("Phase 2"),
-            "expected Phase-2 message, got: {note}"
-        );
+    fn accepts_shared_let() {
+        // Phase 2: `shared` is now a valid let-binding usage. The type
+        // checker is responsible for rejecting cases where the value's
+        // actual usage doesn't match the annotation.
+        match parse_ok("let shared x = y in x") {
+            Expr::Let { usage, name, .. } => {
+                assert_eq!(usage, Usage::Shared);
+                assert_eq!(name, "x");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     // -- Phase 1: tuples --

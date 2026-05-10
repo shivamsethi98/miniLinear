@@ -1,0 +1,4 @@
+// EXPECT: type error
+let linear y = (1, 2) in
+  let shared s = y in
+    let (a, b) = y in a + b

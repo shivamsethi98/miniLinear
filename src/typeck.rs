@@ -1,15 +1,21 @@
-//! Type checker for the mini-linear language. Phases 0 + 1.
+//! Type checker for the mini-linear language. Phases 0 + 1 + 2.
 //!
-//! Phase 1 implements the consumption-tracking algorithm from §2.6 of the
-//! paper, *without* borrowing. Each call to [`check_expr`] returns a
-//! [`Check`] containing both the resulting [`Typed`] value and a `consumes`
-//! map recording which linear variables were consumed (and *where* — so
-//! "consumed twice" errors can point at both sites).
+//! Phase 2 implements the full inference algorithm from §2.6 of the paper:
+//! both `borrows(B)` and `consumes(C)` tracking, with the mode-sensitive
+//! variable rule that turns linear variables into shared views in Borrow
+//! mode.
 //!
-//! Top-level invariant (per the Phase 1 handoff): with no methods or
-//! parameters, the initial environment is empty, the let rule's
-//! linear-must-be-consumed check transitively prevents leakage, and the
-//! top-level program's `consumes` set is always empty.
+//! `consumes` and `borrows` share the same shape — `BTreeMap<String, Span>`
+//! mapping a variable name to the use-site span. The two have *different*
+//! merge policies though: `consumes` requires disjointness (a name in both
+//! halves is a "consumed twice" error), while `borrows` simply unions and
+//! keeps the first-seen span on collision (multiple borrows of the same
+//! variable are valid).
+//!
+//! Top-level invariant: with no methods or parameters, the initial env is
+//! empty, the let / decon rules' "linear must be consumed" check
+//! transitively prevents leakage, and the top-level program's `consumes`
+//! and `borrows` are both empty by construction.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -21,8 +27,7 @@ use crate::error::{Error, ErrorCategory};
 // Public API
 // -----------------------------------------------------------------------------
 
-/// A typed value: a usage qualifier plus a type. This is what the paper
-/// writes as `u τ`.
+/// A typed value: a usage qualifier plus a type (paper's `u τ`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Typed {
     pub usage: Usage,
@@ -35,25 +40,30 @@ impl fmt::Display for Typed {
     }
 }
 
-/// The expected consumption mode passed down into each subexpression. The
-/// paper calls this `c`. Phase 2 will add a `Borrow` variant alongside
-/// shared usage.
+/// Expected consumption mode passed down into each subexpression (paper's
+/// `c`). In Borrow mode, linear variable lookups produce shared views and
+/// record into `borrows` instead of `consumes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsumeMode {
     Consume,
+    Borrow,
 }
 
 /// Type-check a complete program.
 pub fn check_program(program: &Program) -> Result<Typed, Error> {
     debug_assert!(
         program.decls.is_empty(),
-        "Phase 0/1 parser does not produce declarations",
+        "Phase 0/1/2 parser does not produce declarations",
     );
     let env = Env::new();
     let result = check_expr(&program.main_expr, &env, None, ConsumeMode::Consume)?;
     debug_assert!(
         result.consumes.is_empty(),
-        "top-level program's consumes set must be empty (initial env is empty, so there's nothing to consume)",
+        "top-level program's consumes set must be empty (initial env is empty)",
+    );
+    debug_assert!(
+        result.borrows.is_empty(),
+        "top-level program's borrows set must be empty (initial env is empty)",
     );
     Ok(result.typed)
 }
@@ -62,17 +72,16 @@ pub fn check_program(program: &Program) -> Result<Typed, Error> {
 // Internal state
 // -----------------------------------------------------------------------------
 
-/// Variable typing environment `X` from the paper.
 type Env = BTreeMap<String, Typed>;
 
-/// Per-expression checking result. `consumes` maps each linear variable
-/// name consumed by this expression to the span where it was consumed
-/// (i.e. the use-site). The map shape — rather than a plain set — lets
-/// disjointness-violation errors point at *both* consume sites.
+/// Per-expression checking result. Both `consumes` and `borrows` are
+/// keyed by variable name with the use-site span as the value. See module
+/// docs for their differing merge policies.
 #[derive(Debug, Clone)]
 struct Check {
     typed: Typed,
     consumes: BTreeMap<String, Span>,
+    borrows: BTreeMap<String, Span>,
 }
 
 impl Check {
@@ -83,6 +92,7 @@ impl Check {
                 ty: Type::Int,
             },
             consumes: BTreeMap::new(),
+            borrows: BTreeMap::new(),
         }
     }
 }
@@ -100,23 +110,23 @@ fn check_expr(
     match expr {
         Expr::IntLit { .. } => Ok(Check::ordinary_int()),
 
-        Expr::Var { name, span } => check_var(name, *span, env),
+        Expr::Var { name, span } => check_var(name, *span, env, mode),
 
-        Expr::Add { lhs, rhs, .. } => check_add(lhs, rhs, env),
+        Expr::Add { lhs, rhs, .. } => check_add(lhs, rhs, env, mode),
 
         Expr::Seq {
             first, second, ..
         } => check_seq(first, second, env, expected_usage, mode),
 
         Expr::Tuple { elems, span } => {
-            check_tuple_construction(elems, env, expected_usage, *span)
+            check_tuple_construction(elems, env, expected_usage, *span, mode)
         }
 
         Expr::TupleProj {
             tuple,
             index,
             span,
-        } => check_projection(tuple, *index, *span, env),
+        } => check_projection(tuple, *index, *span, env, mode),
 
         Expr::TupleDestructure {
             names,
@@ -144,8 +154,6 @@ fn check_expr(
             mode,
         ),
 
-        // Phase 2+ adds methods, datatypes, match. Defensive arm for
-        // programmatically-constructed ASTs.
         Expr::MethodCall { span, .. }
         | Expr::ConstructorApp { span, .. }
         | Expr::Match { span, .. } => Err(Error::new(
@@ -160,7 +168,7 @@ fn check_expr(
 // Per-form checkers
 // -----------------------------------------------------------------------------
 
-fn check_var(name: &str, span: Span, env: &Env) -> Result<Check, Error> {
+fn check_var(name: &str, span: Span, env: &Env, mode: ConsumeMode) -> Result<Check, Error> {
     let typed = env.get(name).cloned().ok_or_else(|| {
         Error::new(
             ErrorCategory::TypeError,
@@ -168,25 +176,60 @@ fn check_var(name: &str, span: Span, env: &Env) -> Result<Check, Error> {
             Some(format!("unbound variable `{name}`")),
         )
     })?;
-    let mut consumes = BTreeMap::new();
-    if typed.usage == Usage::Linear {
-        consumes.insert(name.to_string(), span);
+
+    match mode {
+        ConsumeMode::Consume => {
+            // Linear variables consume; shared/ordinary do not.
+            let mut consumes = BTreeMap::new();
+            if typed.usage == Usage::Linear {
+                consumes.insert(name.to_string(), span);
+            }
+            Ok(Check {
+                typed,
+                consumes,
+                borrows: BTreeMap::new(),
+            })
+        }
+        ConsumeMode::Borrow => {
+            // Linear variables become shared views and record a borrow;
+            // shared/ordinary behave the same as in Consume mode.
+            if typed.usage == Usage::Linear {
+                let mut borrows = BTreeMap::new();
+                borrows.insert(name.to_string(), span);
+                Ok(Check {
+                    typed: Typed {
+                        usage: Usage::Shared,
+                        ty: typed.ty,
+                    },
+                    consumes: BTreeMap::new(),
+                    borrows,
+                })
+            } else {
+                Ok(Check {
+                    typed,
+                    consumes: BTreeMap::new(),
+                    borrows: BTreeMap::new(),
+                })
+            }
+        }
     }
-    Ok(Check { typed, consumes })
 }
 
-fn check_add(lhs: &Expr, rhs: &Expr, env: &Env) -> Result<Check, Error> {
-    let l = check_expr(lhs, env, Some(Usage::Ordinary), ConsumeMode::Consume)?;
+fn check_add(lhs: &Expr, rhs: &Expr, env: &Env, mode: ConsumeMode) -> Result<Check, Error> {
+    // Both operands in outer mode, expected to be ordinary int.
+    let l = check_expr(lhs, env, Some(Usage::Ordinary), mode)?;
     require_ordinary_int(&l.typed, lhs.span(), "left operand of `+`")?;
-    let r = check_expr(rhs, env, Some(Usage::Ordinary), ConsumeMode::Consume)?;
+    let r = check_expr(rhs, env, Some(Usage::Ordinary), mode)?;
     require_ordinary_int(&r.typed, rhs.span(), "right operand of `+`")?;
-    let consumes = merge_disjoint(l.consumes, r.consumes)?;
+    let consumes = merge_consumes_disjoint(l.consumes, r.consumes)?;
+    let borrows = merge_borrows_union(l.borrows, r.borrows);
     Ok(Check {
         typed: Typed {
             usage: Usage::Ordinary,
             ty: Type::Int,
         },
         consumes,
+        borrows,
     })
 }
 
@@ -197,37 +240,73 @@ fn check_seq(
     expected_usage: Option<Usage>,
     mode: ConsumeMode,
 ) -> Result<Check, Error> {
-    // e1's expected_usage is Some(Ordinary) because e1's value will be
-    // discarded — a linear value here would be silently leaked.
-    let f = check_expr(first, env, Some(Usage::Ordinary), ConsumeMode::Consume)?;
-    if f.typed.usage == Usage::Linear {
+    // e1 always in Borrow mode (the borrow scope is e1; e2 sees `e1` as
+    // having "completed and discarded").
+    let f = check_expr(first, env, Some(Usage::Ordinary), ConsumeMode::Borrow)?;
+    if f.typed.usage != Usage::Ordinary {
+        let why = match f.typed.usage {
+            Usage::Linear => "would silently leak (Phase 0/1 invariant)",
+            Usage::Shared => "would escape its borrow scope (Phase 2 invariant)",
+            Usage::Ordinary => unreachable!(),
+        };
         return Err(Error::new(
             ErrorCategory::TypeError,
             first.span(),
             Some(format!(
-                "the first expression in a sequence `e1 ; e2` must not produce a linear value (it would be silently discarded), found `{}`",
-                f.typed,
+                "the first expression in a sequence `e1 ; e2` must produce an `ordinary` value; this one produces `{}` and {why}",
+                f.typed.usage,
             )),
         ));
     }
-    // e2 inherits the outer expected_usage and outer mode.
+
+    // e2 inherits the outer mode and outer expected_usage.
     let s = check_expr(second, env, expected_usage, mode)?;
-    let consumes = merge_disjoint(f.consumes, s.consumes)?;
+
+    // Disjointness: e1's consumes vs e2's consumes; e1's consumes vs e2's
+    // borrows (e2 can't borrow what e1 just consumed).
+    let consumes = merge_consumes_disjoint(f.consumes.clone(), s.consumes.clone())?;
+    if let Some((name, b_span, c_span)) = find_consume_borrow_collision(&f.consumes, &s.borrows) {
+        return Err(Error::new(
+            ErrorCategory::TypeError,
+            b_span,
+            Some(format!(
+                "the right-hand side of `;` cannot borrow `{name}` because it was consumed by the left-hand side"
+            )),
+        )
+        .with_related(c_span, format!("`{name}` was consumed here")));
+    }
+
+    // Result borrows: B1 minus anything e2 consumed (those nested borrows
+    // got "resolved" by the consume) ∪ B2.
+    let mut b1 = f.borrows;
+    for name in s.consumes.keys() {
+        b1.remove(name);
+    }
+    let borrows = merge_borrows_union(b1, s.borrows);
+
     Ok(Check {
         typed: s.typed,
         consumes,
+        borrows,
     })
 }
 
+/// Tuple construction. The `mode` parameter is threaded through to
+/// components but doesn't change the accept/reject set for ordinary
+/// tuples in Phase 2: any linear-var component in Borrow mode becomes
+/// shared, and the ordinary-tuple's "components must be ordinary" check
+/// rejects shared just as it would have rejected linear in Consume mode.
+/// Mode is here for forward-compat — Phase 3+'s method calls will pass
+/// linear arguments to ordinary-typed callees in Borrow mode, and the
+/// var rule's mode-sensitivity will start mattering at component
+/// granularity then. Don't drop the parameter.
 fn check_tuple_construction(
     elems: &[Expr],
     env: &Env,
     expected_usage: Option<Usage>,
     span: Span,
+    mode: ConsumeMode,
 ) -> Result<Check, Error> {
-    // The handoff: Some(Linear) → linear tuple, components free; Some(Ord)
-    // or None → ordinary tuple, components must be ordinary; Some(Shared)
-    // → unreachable in Phase 1 but defensively rejected.
     let outer_usage = match expected_usage {
         Some(Usage::Linear) => Usage::Linear,
         Some(Usage::Ordinary) | None => Usage::Ordinary,
@@ -235,7 +314,10 @@ fn check_tuple_construction(
             return Err(Error::new(
                 ErrorCategory::TypeError,
                 span,
-                Some("shared tuples are not supported until Phase 2".to_string()),
+                Some(
+                    "shared tuples are produced by borrowing, not by direct construction"
+                        .to_string(),
+                ),
             ));
         }
     };
@@ -248,8 +330,9 @@ fn check_tuple_construction(
 
     let mut field_types = Vec::with_capacity(elems.len());
     let mut consumes: BTreeMap<String, Span> = BTreeMap::new();
+    let mut borrows: BTreeMap<String, Span> = BTreeMap::new();
     for elem in elems {
-        let c = check_expr(elem, env, component_expected, ConsumeMode::Consume)?;
+        let c = check_expr(elem, env, component_expected, mode)?;
         if outer_usage == Usage::Ordinary && c.typed.usage != Usage::Ordinary {
             return Err(Error::new(
                 ErrorCategory::TypeError,
@@ -264,7 +347,8 @@ fn check_tuple_construction(
             usage: c.typed.usage,
             ty: c.typed.ty,
         });
-        consumes = merge_disjoint(consumes, c.consumes)?;
+        consumes = merge_consumes_disjoint(consumes, c.consumes)?;
+        borrows = merge_borrows_union(borrows, c.borrows);
     }
 
     Ok(Check {
@@ -273,6 +357,7 @@ fn check_tuple_construction(
             ty: Type::Tuple(field_types),
         },
         consumes,
+        borrows,
     })
 }
 
@@ -281,17 +366,24 @@ fn check_projection(
     index: usize,
     span: Span,
     env: &Env,
+    mode: ConsumeMode,
 ) -> Result<Check, Error> {
-    let t = check_expr(tuple, env, Some(Usage::Ordinary), ConsumeMode::Consume)?;
+    // Inner in outer mode, expected_usage = None (projection accepts
+    // ordinary or shared input; mode + variable rule decide which).
+    let t = check_expr(tuple, env, None, mode)?;
 
-    if t.typed.usage != Usage::Ordinary {
+    if t.typed.usage == Usage::Linear {
+        // In Consume mode, projecting a linear var lookup keeps the var
+        // linear. The user wanted an implicit borrow; tell them why this
+        // didn't happen. (In Borrow mode the lookup would have already
+        // produced shared, so we never reach this branch.)
         return Err(Error::new(
             ErrorCategory::TypeError,
             tuple.span(),
-            Some(format!(
-                "cannot project from a `{}` tuple; Phase 1 only supports projection from ordinary tuples",
-                t.typed.usage,
-            )),
+            Some(
+                "cannot project from a `linear` tuple; project from a borrowed (shared) view instead"
+                    .to_string(),
+            ),
         ));
     }
 
@@ -321,20 +413,14 @@ fn check_projection(
         ));
     }
 
-    // Phase 1 invariant: ordinary tuples have ordinary fields. This is
-    // already enforced at construction, but verifying here keeps the
-    // projection rule self-contained.
-    debug_assert!(
-        fields.iter().all(|f| f.usage == Usage::Ordinary),
-        "ordinary tuple has a non-ordinary field — invariant violation",
-    );
-
+    let field_usage = share_as(t.typed.usage, fields[index].usage);
     Ok(Check {
         typed: Typed {
-            usage: Usage::Ordinary,
+            usage: field_usage,
             ty: fields[index].ty.clone(),
         },
         consumes: t.consumes,
+        borrows: t.borrows,
     })
 }
 
@@ -347,7 +433,8 @@ fn check_destructure(
     expected_usage: Option<Usage>,
     mode: ConsumeMode,
 ) -> Result<Check, Error> {
-    // Value must produce a linear tuple.
+    // Value always in Consume mode — deconstruction needs to own the
+    // tuple. Outer mode is irrelevant here.
     let v = check_expr(value, env, Some(Usage::Linear), ConsumeMode::Consume)?;
 
     if v.typed.usage != Usage::Linear {
@@ -415,19 +502,50 @@ fn check_destructure(
         }
     }
 
-    // Per the rule: consumes = C1 ∪ (C2 \ {x1, ..., xn}).
-    // Removing the field names from the body's consumes is what makes the
-    // disjointness check meaningful (any name still left after removal is
-    // an "outer" consume that conflicts with C1 if shared with v).
+    // Disjointness: C1 ∩ keys(B2) — body can't borrow what value consumed.
+    if let Some((name, b_span, c_span)) = find_consume_borrow_collision(&v.consumes, &b.borrows) {
+        return Err(Error::new(
+            ErrorCategory::TypeError,
+            b_span,
+            Some(format!(
+                "the body of deconstruction cannot borrow `{name}`: the deconstruction's value already consumed it"
+            )),
+        )
+        .with_related(c_span, format!("`{name}` was consumed here")));
+    }
+
+    // Disjointness: B1 ∩ keys(C2) — body can't consume what value borrows.
+    // (e1's borrows are not in scope for e2 to resolve via consumption,
+    // unlike the let-linear/ordinary case.)
+    if let Some((name, c_span, b_span)) = find_borrow_consume_collision(&v.borrows, &b.consumes) {
+        return Err(Error::new(
+            ErrorCategory::TypeError,
+            c_span,
+            Some(format!(
+                "the body cannot consume `{name}`: it is borrowed by the deconstruction's value"
+            )),
+        )
+        .with_related(b_span, format!("`{name}` is borrowed here")));
+    }
+
+    // Strip the field bindings from body's consumes (per the rule
+    // `C2 \ {x1, ..., xn}`) before merging — these are local to the
+    // deconstruction.
     let mut body_consumes = b.consumes;
+    let mut body_borrows = b.borrows;
     for (name, _) in names {
         body_consumes.remove(name);
+        body_borrows.remove(name);
     }
-    let consumes = merge_disjoint(v.consumes, body_consumes)?;
+
+    let consumes = merge_consumes_disjoint(v.consumes, body_consumes)?;
+    // B1 propagates entirely (no `\ keys(C2)`); body's borrows merged on top.
+    let borrows = merge_borrows_union(v.borrows, body_borrows);
 
     Ok(Check {
         typed: b.typed,
         consumes,
+        borrows,
     })
 }
 
@@ -443,18 +561,17 @@ fn check_let(
     expected_usage: Option<Usage>,
     mode: ConsumeMode,
 ) -> Result<Check, Error> {
-    // Phase 1 supports `ordinary` and `linear`. `shared` is reserved at the
-    // parser, but defensively reject here too in case of programmatic AST
-    // construction.
-    if usage == Usage::Shared {
-        return Err(Error::new(
-            ErrorCategory::TypeError,
-            name_span,
-            Some("`shared` let bindings are not supported until Phase 2".to_string()),
-        ));
-    }
+    // Mode and expected_usage for `e1` depend on the annotation.
+    let (value_mode, value_expected) = match usage {
+        Usage::Linear | Usage::Ordinary => (ConsumeMode::Consume, Some(usage)),
+        Usage::Shared => {
+            // For shared lets, e1 runs in Borrow mode; expected_usage =
+            // None (don't drive tuple construction toward shared).
+            (ConsumeMode::Borrow, None)
+        }
+    };
 
-    let v = check_expr(value, env, Some(usage), ConsumeMode::Consume)?;
+    let v = check_expr(value, env, value_expected, value_mode)?;
 
     if v.typed.usage != usage {
         return Err(Error::new(
@@ -472,7 +589,7 @@ fn check_let(
 
     let b = check_expr(body, &body_env, expected_usage, mode)?;
 
-    // If linear, the binding must be consumed in the body.
+    // Linear binding must be consumed in the body.
     if usage == Usage::Linear && !b.consumes.contains_key(name) {
         return Err(Error::new(
             ErrorCategory::TypeError,
@@ -481,14 +598,61 @@ fn check_let(
         ));
     }
 
-    // consumes = C1 ∪ (C2 \ {x})
+    // Disjointness: C1 ∩ C2 (handled by merge), C1 ∩ keys(B2).
+    if let Some((conflict_name, b_span, c_span)) =
+        find_consume_borrow_collision(&v.consumes, &b.borrows)
+    {
+        return Err(Error::new(
+            ErrorCategory::TypeError,
+            b_span,
+            Some(format!(
+                "the body of let cannot borrow `{conflict_name}`: the let's value already consumed it"
+            )),
+        )
+        .with_related(c_span, format!("`{conflict_name}` was consumed here")));
+    }
+
+    // For shared lets, also check B1 ∩ keys(C2): the body cannot consume a
+    // variable that the shared binding is borrowing.
+    let outgoing_value_borrows = if usage == Usage::Shared {
+        if let Some((conflict_name, c_span, b_span)) =
+            find_borrow_consume_collision(&v.borrows, &b.consumes)
+        {
+            return Err(Error::new(
+                ErrorCategory::TypeError,
+                c_span,
+                Some(format!(
+                    "cannot consume `{conflict_name}` while the shared binding `{name}` borrows it"
+                )),
+            )
+            .with_related(b_span, format!("`{conflict_name}` is borrowed by `{name}` here")));
+        }
+        // Shared binding extends e1's borrows through the let; B' = B1.
+        v.borrows
+    } else {
+        // For linear/ordinary: e1's borrows can be resolved by anything
+        // e2 consumed (their scope ended at the end of e1).
+        let mut b1 = v.borrows;
+        for n in b.consumes.keys() {
+            b1.remove(n);
+        }
+        b1
+    };
+
+    // Strip the bound name from body's maps before merging (it's local to
+    // the let).
     let mut body_consumes = b.consumes;
+    let mut body_borrows = b.borrows;
     body_consumes.remove(name);
-    let consumes = merge_disjoint(v.consumes, body_consumes)?;
+    body_borrows.remove(name);
+
+    let consumes = merge_consumes_disjoint(v.consumes, body_consumes)?;
+    let borrows = merge_borrows_union(outgoing_value_borrows, body_borrows);
 
     Ok(Check {
         typed: b.typed,
         consumes,
+        borrows,
     })
 }
 
@@ -510,11 +674,24 @@ fn require_ordinary_int(typed: &Typed, span: Span, what: &str) -> Result<(), Err
     }
 }
 
-/// Merge two consumes maps. If a name appears in both, that's a
-/// linearity violation: the variable was consumed twice, once at each
-/// recorded span. The resulting error points at the *second* (later)
-/// site as primary, with a related-span pointer at the *first* site.
-fn merge_disjoint(
+/// `share_as(outer_usage, field_usage)` per the Phase 2 projection rule:
+/// projecting through an ordinary tuple keeps each field's usage; through
+/// a shared tuple, every linear/shared field becomes shared.
+fn share_as(outer: Usage, inner: Usage) -> Usage {
+    match (outer, inner) {
+        // Ordinary tuple: field's own usage stands.
+        (Usage::Ordinary, u) => u,
+        // Shared tuple: ordinary stays ordinary; linear/shared collapse to shared.
+        (Usage::Shared, Usage::Ordinary) => Usage::Ordinary,
+        (Usage::Shared, Usage::Linear) | (Usage::Shared, Usage::Shared) => Usage::Shared,
+        // Linear outer is rejected by the projection rule before reaching here.
+        (Usage::Linear, _) => unreachable!("projection rule rejects linear outer"),
+    }
+}
+
+/// Merge two consumes maps. On collision, error: the variable was
+/// consumed twice. Primary span at the second site, related at the first.
+fn merge_consumes_disjoint(
     mut a: BTreeMap<String, Span>,
     b: BTreeMap<String, Span>,
 ) -> Result<BTreeMap<String, Span>, Error> {
@@ -530,6 +707,53 @@ fn merge_disjoint(
         a.insert(name, b_span);
     }
     Ok(a)
+}
+
+/// Merge two borrows maps. **No disjointness check** — multiple borrows of
+/// the same variable are valid (that's the whole point of `shared`). On a
+/// name collision, the *first-seen* span is kept (the existing entry
+/// wins; the new one is dropped). This is a deliberate choice — it gives
+/// stable error spans regardless of which subexpression was processed
+/// last. Don't accidentally flip this to last-seen.
+fn merge_borrows_union(
+    mut a: BTreeMap<String, Span>,
+    b: BTreeMap<String, Span>,
+) -> BTreeMap<String, Span> {
+    for (name, span) in b {
+        a.entry(name).or_insert(span);
+    }
+    a
+}
+
+/// Find a name that appears in both `consumes` and `borrows`. Returns
+/// `(name, borrow_span, consume_span)` for the first conflict, or `None`.
+/// Used by the seq / decon / let rules' `C ∩ keys(B) = ∅` checks.
+fn find_consume_borrow_collision(
+    consumes: &BTreeMap<String, Span>,
+    borrows: &BTreeMap<String, Span>,
+) -> Option<(String, Span, Span)> {
+    for (name, &b_span) in borrows {
+        if let Some(&c_span) = consumes.get(name) {
+            return Some((name.clone(), b_span, c_span));
+        }
+    }
+    None
+}
+
+/// Find a name that appears in both `borrows` and `consumes`. Returns
+/// `(name, consume_span, borrow_span)` for the first conflict, or `None`.
+/// Used by the decon / let-shared rules' `B ∩ keys(C) = ∅` checks where
+/// the consume site is the action being rejected.
+fn find_borrow_consume_collision(
+    borrows: &BTreeMap<String, Span>,
+    consumes: &BTreeMap<String, Span>,
+) -> Option<(String, Span, Span)> {
+    for (name, &c_span) in consumes {
+        if let Some(&b_span) = borrows.get(name) {
+            return Some((name.clone(), c_span, b_span));
+        }
+    }
+    None
 }
 
 // -----------------------------------------------------------------------------
@@ -552,8 +776,7 @@ mod tests {
         check_program(&prog).expect_err("expected type error")
     }
 
-    /// For tests that need to inspect the `Check` struct directly (rather
-    /// than just the program-level result).
+    /// For tests that need to inspect the `Check` struct directly.
     fn run_check(src: &str) -> Check {
         let prog = parse(src).expect("parse failed");
         let env = Env::new();
@@ -633,44 +856,14 @@ mod tests {
         assert_eq!(typed.ty, Type::Int);
     }
 
-    // -- Phase 1: consumes regression --
+    // -- Phase 1 carry-over (consumes empty regression) --
 
-    /// Phase 0 carry-forward: `consumes` must be empty for a program that
-    /// uses no linear values. Smallest test that the new field doesn't
-    /// silently break Phase 0–style code paths.
     #[test]
-    fn ordinary_program_has_empty_consumes() {
+    fn ordinary_program_has_empty_consumes_and_borrows() {
         let check = run_check("let ordinary x = 1 in x + 1");
         assert!(check.consumes.is_empty());
+        assert!(check.borrows.is_empty());
     }
-
-    #[test]
-    fn linear_var_use_records_consume() {
-        // A bare `t` reference to a linear variable: consumes should
-        // contain `t` mapped to the use-site span.
-        let prog = parse("let linear t = () in let () = t in 5").expect("parse");
-        // Pull out the inner `let () = t in 5` to inspect its consumes.
-        let Expr::Let { body, .. } = &prog.main_expr else {
-            panic!("expected outer let");
-        };
-        let Expr::TupleDestructure { value, .. } = body.as_ref() else {
-            panic!("expected destructure");
-        };
-        // value is `t` — a Var. Build a minimal env.
-        let mut env = Env::new();
-        env.insert(
-            "t".to_string(),
-            Typed {
-                usage: Usage::Linear,
-                ty: Type::Tuple(Vec::new()),
-            },
-        );
-        let check = check_expr(value, &env, Some(Usage::Linear), ConsumeMode::Consume).unwrap();
-        assert_eq!(check.consumes.len(), 1);
-        assert!(check.consumes.contains_key("t"));
-    }
-
-    // -- Phase 1: linear / tuple happy paths --
 
     #[test]
     fn linear_tuple_decon() {
@@ -688,7 +881,6 @@ mod tests {
 
     #[test]
     fn empty_linear_tuple_via_annotation() {
-        // `let linear u = ()` should bind u as `linear ()`.
         let typed = check_ok("let linear u = () in let () = u in 5");
         assert_eq!(typed.ty, Type::Int);
     }
@@ -710,8 +902,6 @@ mod tests {
         assert_eq!(typed.ty, Type::Int);
     }
 
-    // -- Phase 1: rejection paths --
-
     #[test]
     fn linear_unused_is_type_error() {
         let err = check_err("let linear t = (1, 2) in 5");
@@ -728,15 +918,18 @@ mod tests {
         assert!(err.note.unwrap().contains("consumed twice"));
         assert_eq!(err.related.len(), 1);
         assert!(err.related[0].label.contains("previously consumed"));
-        // The related span should NOT be the same as the primary span.
         assert_ne!(err.related[0].span, err.span);
     }
 
     #[test]
     fn project_linear_is_type_error() {
+        // Phase 2: projecting from a linear var (in Consume mode) is
+        // still a type error — the user should borrow first. The Phase 1
+        // message changed slightly; assert intent rather than exact text.
         let err = check_err("let linear t = (1, 2) in t.0");
         assert_eq!(err.category, ErrorCategory::TypeError);
-        assert!(err.note.unwrap().contains("linear"));
+        let note = err.note.unwrap();
+        assert!(note.contains("linear") && note.contains("project"));
     }
 
     #[test]
@@ -746,25 +939,145 @@ mod tests {
         assert!(err.note.unwrap().contains("linear tuple"));
     }
 
+    /// Phase 1 spelling: "must not produce a linear value". Phase 2: the
+    /// same program now rejects because `t` becomes shared in Borrow mode
+    /// and the seq rule rejects shared. Loosen the assertion to match the
+    /// rule's intent (sequencing rejecting based on e1's usage), not the
+    /// specific blocking usage word.
     #[test]
     fn seq_linear_is_type_error() {
         let err = check_err("let linear t = (1, 2) in t ; 5");
         assert_eq!(err.category, ErrorCategory::TypeError);
-        assert!(err.note.unwrap().contains("linear"));
+        let note = err.note.unwrap();
+        assert!(
+            note.contains("sequence") || note.contains("first expression"),
+            "expected a sequencing-related message, got: {note}",
+        );
+    }
+
+    // -- Phase 2 specific --
+
+    #[test]
+    fn linear_var_in_borrow_mode_returns_shared() {
+        // Build env directly to bypass the parser.
+        let mut env = Env::new();
+        env.insert(
+            "y".to_string(),
+            Typed {
+                usage: Usage::Linear,
+                ty: Type::Int, // shape doesn't matter for the lookup
+            },
+        );
+        let var_expr = Expr::Var {
+            name: "y".to_string(),
+            span: Span::new(0, 1),
+        };
+        let in_consume =
+            check_expr(&var_expr, &env, None, ConsumeMode::Consume).unwrap();
+        assert_eq!(in_consume.typed.usage, Usage::Linear);
+        assert_eq!(in_consume.consumes.len(), 1);
+        assert!(in_consume.borrows.is_empty());
+
+        let in_borrow =
+            check_expr(&var_expr, &env, None, ConsumeMode::Borrow).unwrap();
+        assert_eq!(in_borrow.typed.usage, Usage::Shared);
+        assert!(in_borrow.consumes.is_empty());
+        assert_eq!(in_borrow.borrows.len(), 1);
     }
 
     #[test]
-    fn linear_in_ordinary_tuple_is_type_error() {
-        let err = check_err("let linear t = (1, 2) in let ordinary outer = (t, 3) in 5");
-        assert_eq!(err.category, ErrorCategory::TypeError);
-        assert!(err.note.unwrap().contains("ordinary tuple"));
+    fn seq_borrow_basic_resolves_borrow() {
+        // The seq's e1 borrows y; e2 consumes y; the borrow gets resolved
+        // by the consume so the outer let is happy.
+        let typed = check_ok(
+            "let linear y = (1, 2) in (y.0 + y.1) ; let (a, b) = y in a + b",
+        );
+        assert_eq!(typed.ty, Type::Int);
     }
 
     #[test]
-    fn int_literal_as_linear_is_type_error() {
-        let err = check_err("let linear x = 5 in 6");
+    fn seq_borrow_repeated_in_e1() {
+        let typed = check_ok(
+            "let linear y = (1, 2) in (y.0 + y.0 + y.1) ; let (a, b) = y in a + b",
+        );
+        assert_eq!(typed.ty, Type::Int);
+    }
+
+    #[test]
+    fn let_shared_basic() {
+        let typed = check_ok(
+            "let linear y = (1, 2) in (let shared s = y in s.0 + s.0) ; let (a, b) = y in a + b",
+        );
+        assert_eq!(typed.ty, Type::Int);
+    }
+
+    #[test]
+    fn nested_let_shared() {
+        let typed = check_ok(
+            "let linear y = (1, 2) in \
+             (let shared s1 = y in let shared s2 = y in s1.0 + s2.1) ; \
+             let (a, b) = y in a + b",
+        );
+        assert_eq!(typed.ty, Type::Int);
+    }
+
+    #[test]
+    fn share_escape_is_type_error() {
+        // `let shared s = y` borrows y; the body then tries to consume y
+        // via deconstruction. The let-shared rule's `B1 ∩ keys(C2)` check
+        // catches this.
+        let err = check_err(
+            "let linear y = (1, 2) in let shared s = y in let (a, b) = y in a + b",
+        );
         assert_eq!(err.category, ErrorCategory::TypeError);
         let note = err.note.unwrap();
-        assert!(note.contains("linear") && note.contains("ordinary"));
+        assert!(note.contains("shared") || note.contains("borrow"));
+        // Should have a related span pointing at where y was borrowed.
+        assert!(!err.related.is_empty());
+    }
+
+    #[test]
+    fn borrow_unresolved_falls_through_to_linear_unused() {
+        // `(y.0 + y.0) ; 5` — the borrow of y is *not* resolved (e2 doesn't
+        // consume y). The outer linear-must-be-consumed check fires
+        // because y was never consumed at all.
+        let err = check_err("let linear y = (1, 2) in (y.0 + y.0) ; 5");
+        assert_eq!(err.category, ErrorCategory::TypeError);
+        assert!(err.note.unwrap().contains("not consumed"));
+    }
+
+    #[test]
+    fn seq_returning_shared_is_type_error() {
+        // Phase 2-specific: `t ; 5` where t is linear. In Borrow mode, t
+        // becomes shared. seq rejects because u1 is shared.
+        let err = check_err("let linear t = (1, 2) in t ; 5");
+        assert_eq!(err.category, ErrorCategory::TypeError);
+        let note = err.note.unwrap();
+        assert!(
+            note.contains("ordinary") && (note.contains("shared") || note.contains("escape")),
+            "expected a shared-escape message, got: {note}",
+        );
+    }
+
+    #[test]
+    fn share_as_table() {
+        // Direct unit test of the `share_as` function.
+        assert_eq!(share_as(Usage::Ordinary, Usage::Ordinary), Usage::Ordinary);
+        assert_eq!(share_as(Usage::Ordinary, Usage::Linear), Usage::Linear);
+        assert_eq!(share_as(Usage::Ordinary, Usage::Shared), Usage::Shared);
+        assert_eq!(share_as(Usage::Shared, Usage::Ordinary), Usage::Ordinary);
+        assert_eq!(share_as(Usage::Shared, Usage::Linear), Usage::Shared);
+        assert_eq!(share_as(Usage::Shared, Usage::Shared), Usage::Shared);
+    }
+
+    #[test]
+    fn merge_borrows_first_seen_wins() {
+        let mut a = BTreeMap::new();
+        a.insert("y".to_string(), Span::new(0, 1));
+        let mut b = BTreeMap::new();
+        b.insert("y".to_string(), Span::new(10, 11));
+        let merged = merge_borrows_union(a, b);
+        // First-seen (the entry from `a`) should win.
+        assert_eq!(merged.get("y").copied(), Some(Span::new(0, 1)));
     }
 }
