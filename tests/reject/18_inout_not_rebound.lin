@@ -1,0 +1,3 @@
+// EXPECT: type error
+method bad(linear inout p: (int, int)) returns () { let (a, b) = p in a + b }
+1

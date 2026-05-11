@@ -1,0 +1,3 @@
+// EXPECT: type error
+method add(ordinary x: int, ordinary y: int) returns (ordinary r: int) { x + y }
+add(1, 2, 3)

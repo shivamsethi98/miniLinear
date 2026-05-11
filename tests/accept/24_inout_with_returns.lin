@@ -1,0 +1,5 @@
+method incr_and_first(linear inout p: (int, int)) returns (ordinary first: int) {
+  let (a, b) = p in let linear new_p = (a + 1, b + 1) in (a, new_p)
+}
+let linear t = (5, 7) in let (first, new_t) = incr_and_first(t) in
+let (x, y) = new_t in first + x + y

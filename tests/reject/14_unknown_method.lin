@@ -1,0 +1,2 @@
+// EXPECT: type error
+unknown(1, 2)

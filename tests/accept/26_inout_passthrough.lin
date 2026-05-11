@@ -1,0 +1,3 @@
+method passthrough(linear inout p: (int, int)) returns () { p }
+let linear t = (5, 5) in let linear new_t = passthrough(t) in
+let (x, y) = new_t in x + y

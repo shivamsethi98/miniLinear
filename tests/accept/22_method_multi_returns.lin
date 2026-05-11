@@ -1,0 +1,2 @@
+method pair(ordinary x: int) returns (ordinary a: int, ordinary b: int) { (x, x + 1) }
+let ordinary t = pair(5) in t.0 + t.1

@@ -1,0 +1,2 @@
+method ignore(ordinary x: int) returns (ordinary r: int) { 42 }
+ignore(7)

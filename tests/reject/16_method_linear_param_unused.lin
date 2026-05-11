@@ -1,0 +1,3 @@
+// EXPECT: type error
+method bad(linear t: (int, int)) returns (ordinary r: int) { 5 }
+bad((1, 2))

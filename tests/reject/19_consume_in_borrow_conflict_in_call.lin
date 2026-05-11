@@ -1,0 +1,5 @@
+// EXPECT: type error
+method M(linear t: (int, int), shared s: (int, int)) returns (ordinary r: int) {
+  let (a, b) = t in s.0 + a + b
+}
+let linear y = (1, 2) in M(y, y)

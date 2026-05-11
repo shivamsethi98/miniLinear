@@ -1,0 +1,2 @@
+method add(ordinary x: int, ordinary y: int) returns (ordinary r: int) { x + y }
+add(3, 4)

@@ -1,0 +1,2 @@
+method peek(shared p: (int, int)) returns (ordinary r: int) { p.0 + p.1 }
+let linear y = (1, 2) in peek(y) ; let (a, b) = y in a + b

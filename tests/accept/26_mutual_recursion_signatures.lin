@@ -1,0 +1,3 @@
+method first(ordinary x: int) returns (ordinary r: int) { second(x + 1) }
+method second(ordinary x: int) returns (ordinary r: int) { x + 10 }
+first(5)
