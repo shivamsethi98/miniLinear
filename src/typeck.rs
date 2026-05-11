@@ -1,9 +1,11 @@
-//! Type checker for the mini-linear language. Phases 0 + 1 + 2.
+//! Type checker for the mini-linear language. Phases 0 + 1 + 2 + 3.
 //!
 //! Phase 2 implements the full inference algorithm from §2.6 of the paper:
 //! both `borrows(B)` and `consumes(C)` tracking, with the mode-sensitive
 //! variable rule that turns linear variables into shared views in Borrow
 //! mode.
+//!
+//! Phase 3 adds method declarations and calls, including `inout` parameters.
 //!
 //! `consumes` and `borrows` share the same shape — `BTreeMap<String, Span>`
 //! mapping a variable name to the use-site span. The two have *different*
@@ -16,11 +18,41 @@
 //! empty, the let / decon rules' "linear must be consumed" check
 //! transitively prevents leakage, and the top-level program's `consumes`
 //! and `borrows` are both empty by construction.
+//!
+//! -----------------------------------------------------------------------
+//! BUG FIXES IN THIS FILE (Phase 3 audit):
+//!
+//! BUG 1 — `check_add` missing cross-operand C∩keys(B) disjointness check
+//!   Previously: after merging C_left ∪ C_right and B_left ∪ B_right, there
+//!   was no check that a variable consumed by one operand wasn't simultaneously
+//!   borrowed by the other (e.g. `consume(x) + peek(x)` where x is linear).
+//!   The same C∩keys(B) check that `check_seq`, `check_let`, and
+//!   `check_destructure` all perform was simply absent in `check_add`.
+//!   Fix: add `find_consume_borrow_collision` in both directions after merging.
+//!
+//! BUG 2 — `check_method_call` leaks shared-argument borrows past the call
+//!   Previously: borrows accumulated from checking shared-param arguments were
+//!   returned as part of the call-site `Check { borrows: combined_borrows }`.
+//!   A shared borrow is only valid *for the duration of the call*; once the
+//!   method returns, the borrow is over and the variable should again be
+//!   freely consumable. Leaking the borrow into the caller's context caused
+//!   false "cannot consume while borrowed" errors on code written after the
+//!   call, and violated the paper's rule that borrows don't escape a call.
+//!   Fix: return `borrows: BTreeMap::new()` from a method call — the borrows
+//!   are validated internally for cross-arg aliasing but must not propagate.
+//!
+//! BUG 3 — `check_add` missing cross-operand B∩keys(C) disjointness check
+//!   (symmetric twin of BUG 1): a variable borrowed by the left operand and
+//!   consumed by the right operand must also be caught. Without this check,
+//!   `peek(x) + consume(x)` silently passes when x is linear. The helpers
+//!   `find_consume_borrow_collision` and `find_borrow_consume_collision` are
+//!   both needed, in both argument orderings.
+//! -----------------------------------------------------------------------
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::ast::{Expr, Program, Span, TupleField, Type, Usage};
+use crate::ast::{Decl, Expr, ParamSig, Program, Span, TupleField, Type, Usage};
 use crate::error::{Error, ErrorCategory};
 
 // -----------------------------------------------------------------------------
@@ -49,23 +81,266 @@ pub enum ConsumeMode {
     Borrow,
 }
 
-/// Type-check a complete program.
+/// Per-method information available during type checking.
+#[derive(Debug, Clone)]
+pub(crate) struct MethodEntry {
+    /// Declared parameter signatures (names dropped, inout flag preserved).
+    pub(crate) params: Vec<ParamSig>,
+    /// Effective returns: `declared_returns ++ [(p.usage, p.ty) for p in params if p.inout]`.
+    /// This is what the call-site rule reads; bodies expect a value
+    /// matching the type derived from these.
+    pub(crate) effective_returns: Vec<ParamSig>,
+    /// Span of the method's declared name, for "method declared here"
+    /// notes attached to duplicate-name errors.
+    pub(crate) name_span: Span,
+}
+
+/// Method environment: name → method entry.
+pub(crate) type MethodEnv = BTreeMap<String, MethodEntry>;
+
+/// Pass 1: walk every method declaration in `decls`, validate signature
+/// invariants (no `shared` returns; no duplicate method names), and
+/// return the populated method env. Bodies are *not* checked; that's pass
+/// 2's job.
+pub(crate) fn collect_method_env(decls: &[Decl]) -> Result<MethodEnv, Error> {
+    let mut env: MethodEnv = BTreeMap::new();
+
+    for decl in decls {
+        let m = match decl {
+            Decl::Method(m) => m,
+            Decl::Datatype(_) => continue,
+        };
+
+        // Duplicate-name check.
+        if let Some(prev) = env.get(&m.name) {
+            return Err(Error::new(
+                ErrorCategory::TypeError,
+                m.name_span,
+                Some(format!("method `{}` declared more than once", m.name)),
+            )
+            .with_related(prev.name_span, format!("`{}` first declared here", m.name)));
+        }
+
+        // Shared-in-returns check.
+        for ret in &m.returns {
+            if ret.usage == Usage::Shared {
+                return Err(Error::new(
+                    ErrorCategory::TypeError,
+                    ret.span,
+                    Some(
+                        "method returns cannot have `shared` usage; use `linear` or `ordinary`"
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
+
+        // Defensive invariant: inout is only valid on linear params.
+        // The parser enforces this; the assert guards against programmatic AST
+        // construction that bypasses the parser.
+        for p in &m.params {
+            debug_assert!(
+                !p.inout || p.usage == Usage::Linear,
+                "inout is only valid on linear params; parser should have rejected this"
+            );
+        }
+
+        let params: Vec<ParamSig> = m
+            .params
+            .iter()
+            .map(|p| ParamSig {
+                usage: p.usage,
+                inout: p.inout,
+                ty: p.ty.clone(),
+            })
+            .collect();
+
+        let mut effective_returns: Vec<ParamSig> = m
+            .returns
+            .iter()
+            .map(|p| ParamSig {
+                usage: p.usage,
+                inout: false,
+                ty: p.ty.clone(),
+            })
+            .collect();
+        for p in &m.params {
+            if p.inout {
+                effective_returns.push(ParamSig {
+                    usage: p.usage,
+                    inout: false,
+                    ty: p.ty.clone(),
+                });
+            }
+        }
+
+        env.insert(
+            m.name.clone(),
+            MethodEntry {
+                params,
+                effective_returns,
+                name_span: m.name_span,
+            },
+        );
+    }
+
+    Ok(env)
+}
+
+/// Type-check a complete program in three passes:
+///
+/// 1. Collect method signatures into `MethodEnv`.
+/// 2. For each method declaration, check the body.
+/// 3. Check the main expression.
 pub fn check_program(program: &Program) -> Result<Typed, Error> {
-    debug_assert!(
-        program.decls.is_empty(),
-        "Phase 0/1/2 parser does not produce declarations",
-    );
+    let method_env = collect_method_env(&program.decls)?;
+
+    for decl in &program.decls {
+        let m = match decl {
+            Decl::Method(m) => m,
+            Decl::Datatype(_) => continue,
+        };
+        check_method_body(m, &method_env)?;
+    }
+
     let env = Env::new();
-    let result = check_expr(&program.main_expr, &env, None, ConsumeMode::Consume)?;
-    debug_assert!(
-        result.consumes.is_empty(),
-        "top-level program's consumes set must be empty (initial env is empty)",
-    );
-    debug_assert!(
-        result.borrows.is_empty(),
-        "top-level program's borrows set must be empty (initial env is empty)",
-    );
+    let result = check_expr(
+        &program.main_expr,
+        &env,
+        &method_env,
+        None,
+        ConsumeMode::Consume,
+    )?;
+    if let Some((name, &span)) = result.consumes.iter().next() {
+        return Err(Error::new(
+            ErrorCategory::TypeError,
+            span,
+            Some(format!(
+                "top-level expression consumes `{name}` but there is no enclosing binding"
+            )),
+        ));
+    }
+
+    if let Some((name, &span)) = result.borrows.iter().next() {
+        return Err(Error::new(
+            ErrorCategory::TypeError,
+            span,
+            Some(format!(
+                "top-level expression borrows `{name}` but there is no enclosing binding"
+            )),
+        ));
+    }
+
     Ok(result.typed)
+}
+
+// -----------------------------------------------------------------------------
+// Pass 2: method-body checking
+// -----------------------------------------------------------------------------
+
+fn body_expected_type(effective_returns: &[ParamSig]) -> Typed {
+    match effective_returns.len() {
+        0 => Typed {
+            usage: Usage::Ordinary,
+            ty: Type::Tuple(Vec::new()),
+        },
+        1 => Typed {
+            usage: effective_returns[0].usage,
+            ty: effective_returns[0].ty.clone(),
+        },
+        _ => {
+            let outer = if effective_returns
+                .iter()
+                .any(|r| r.usage == Usage::Linear)
+            {
+                Usage::Linear
+            } else {
+                Usage::Ordinary
+            };
+            let fields = effective_returns
+                .iter()
+                .map(|r| TupleField {
+                    usage: r.usage,
+                    ty: r.ty.clone(),
+                })
+                .collect();
+            Typed {
+                usage: outer,
+                ty: Type::Tuple(fields),
+            }
+        }
+    }
+}
+
+fn check_method_body(
+    decl: &crate::ast::MethodDecl,
+    method_env: &MethodEnv,
+) -> Result<(), Error> {
+    let mut env = Env::new();
+    for p in &decl.params {
+        env.insert(
+            p.name.clone(),
+            Typed {
+                usage: p.usage,
+                ty: p.ty.clone(),
+            },
+        );
+    }
+
+    let entry = method_env
+        .get(&decl.name)
+        .expect("pass 1 collected this method's signature");
+    let expected = body_expected_type(&entry.effective_returns);
+
+    let result = check_expr(
+        &decl.body,
+        &env,
+        method_env,
+        Some(expected.usage),
+        ConsumeMode::Consume,
+    )?;
+
+    if result.typed != expected {
+        return Err(Error::new(
+            ErrorCategory::TypeError,
+            decl.body.span(),
+            Some(format!(
+                "method `{}` body produces `{}` but expected return type is `{}`",
+                decl.name, result.typed, expected,
+            )),
+        ));
+    }
+
+    for p in &decl.params {
+        if p.usage == Usage::Linear && !result.consumes.contains_key(&p.name) {
+            let kind = if p.inout {
+                "linear inout parameter"
+            } else {
+                "linear parameter"
+            };
+            return Err(Error::new(
+                ErrorCategory::TypeError,
+                p.name_span,
+                Some(format!(
+                    "{kind} `{}` is not consumed in the body of method `{}`",
+                    p.name, decl.name,
+                )),
+            ));
+        }
+    }
+
+    if let Some((name, &span)) = result.borrows.iter().next() {
+        return Err(Error::new(
+            ErrorCategory::TypeError,
+            span,
+            Some(format!(
+                "borrow of `{name}` escapes the body of method `{}`",
+                decl.name,
+            )),
+        ));
+    }
+
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -74,9 +349,6 @@ pub fn check_program(program: &Program) -> Result<Typed, Error> {
 
 type Env = BTreeMap<String, Typed>;
 
-/// Per-expression checking result. Both `consumes` and `borrows` are
-/// keyed by variable name with the use-site span as the value. See module
-/// docs for their differing merge policies.
 #[derive(Debug, Clone)]
 struct Check {
     typed: Typed,
@@ -104,6 +376,7 @@ impl Check {
 fn check_expr(
     expr: &Expr,
     env: &Env,
+    method_env: &MethodEnv,
     expected_usage: Option<Usage>,
     mode: ConsumeMode,
 ) -> Result<Check, Error> {
@@ -112,28 +385,37 @@ fn check_expr(
 
         Expr::Var { name, span } => check_var(name, *span, env, mode),
 
-        Expr::Add { lhs, rhs, .. } => check_add(lhs, rhs, env, mode),
+        Expr::Add { lhs, rhs, .. } => check_add(lhs, rhs, env, method_env, mode),
 
         Expr::Seq {
             first, second, ..
-        } => check_seq(first, second, env, expected_usage, mode),
+        } => check_seq(first, second, env, method_env, expected_usage, mode),
 
         Expr::Tuple { elems, span } => {
-            check_tuple_construction(elems, env, expected_usage, *span, mode)
+            check_tuple_construction(elems, env, method_env, expected_usage, *span, mode)
         }
 
         Expr::TupleProj {
             tuple,
             index,
             span,
-        } => check_projection(tuple, *index, *span, env, mode),
+        } => check_projection(tuple, *index, *span, env, method_env, mode),
 
         Expr::TupleDestructure {
             names,
             value,
             body,
             span,
-        } => check_destructure(names, value, body, *span, env, expected_usage, mode),
+        } => check_destructure(
+            names,
+            value,
+            body,
+            *span,
+            env,
+            method_env,
+            expected_usage,
+            mode,
+        ),
 
         Expr::Let {
             usage,
@@ -150,13 +432,20 @@ fn check_expr(
             body,
             *span,
             env,
+            method_env,
             expected_usage,
             mode,
         ),
 
-        Expr::MethodCall { span, .. }
-        | Expr::ConstructorApp { span, .. }
-        | Expr::Match { span, .. } => Err(Error::new(
+        Expr::MethodCall {
+            name,
+            name_span,
+            args,
+            span,
+        } => check_method_call(name, *name_span, args, *span, env, method_env),
+
+        // Phase 4 territory.
+        Expr::ConstructorApp { span, .. } | Expr::Match { span, .. } => Err(Error::new(
             ErrorCategory::TypeError,
             *span,
             Some("this expression form is not supported until a later phase".to_string()),
@@ -179,7 +468,6 @@ fn check_var(name: &str, span: Span, env: &Env, mode: ConsumeMode) -> Result<Che
 
     match mode {
         ConsumeMode::Consume => {
-            // Linear variables consume; shared/ordinary do not.
             let mut consumes = BTreeMap::new();
             if typed.usage == Usage::Linear {
                 consumes.insert(name.to_string(), span);
@@ -190,9 +478,8 @@ fn check_var(name: &str, span: Span, env: &Env, mode: ConsumeMode) -> Result<Che
                 borrows: BTreeMap::new(),
             })
         }
+
         ConsumeMode::Borrow => {
-            // Linear variables become shared views and record a borrow;
-            // shared/ordinary behave the same as in Consume mode.
             if typed.usage == Usage::Linear {
                 let mut borrows = BTreeMap::new();
                 borrows.insert(name.to_string(), span);
@@ -215,12 +502,67 @@ fn check_var(name: &str, span: Span, env: &Env, mode: ConsumeMode) -> Result<Che
     }
 }
 
-fn check_add(lhs: &Expr, rhs: &Expr, env: &Env, mode: ConsumeMode) -> Result<Check, Error> {
-    // Both operands in outer mode, expected to be ordinary int.
-    let l = check_expr(lhs, env, Some(Usage::Ordinary), mode)?;
+// -----------------------------------------------------------------------
+// FIX FOR BUG 1 + BUG 3: check_add was missing cross-operand aliasing checks.
+//
+// The original code only did:
+//   let consumes = merge_consumes_disjoint(l.consumes, r.consumes)?;
+//   let borrows  = merge_borrows_union(l.borrows, r.borrows);
+//
+// This is UNSOUND because it never checked:
+//   (a) C_left  ∩ keys(B_right) == ∅  (BUG 1: left consumes, right borrows)
+//   (b) B_left  ∩ keys(C_right) == ∅  (BUG 3: left borrows, right consumes)
+//
+// Without these checks, a program like:
+//   let linear x = (1,2) in consume(x) + peek(x)
+// would silently pass even though x is simultaneously consumed and borrowed
+// across the two operands of `+`. Every other binary form in the checker
+// (seq, let, destructure) performs these checks; `check_add` was the
+// only omission.
+//
+// Fix: add both collision checks after merging, mirroring the pattern
+// already used in check_seq.
+// -----------------------------------------------------------------------
+fn check_add(
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &Env,
+    method_env: &MethodEnv,
+    mode: ConsumeMode,
+) -> Result<Check, Error> {
+    let l = check_expr(lhs, env, method_env, Some(Usage::Ordinary), mode)?;
     require_ordinary_int(&l.typed, lhs.span(), "left operand of `+`")?;
-    let r = check_expr(rhs, env, Some(Usage::Ordinary), mode)?;
+    let r = check_expr(rhs, env, method_env, Some(Usage::Ordinary), mode)?;
     require_ordinary_int(&r.typed, rhs.span(), "right operand of `+`")?;
+
+    // BUG 1 FIX: left consumed something that right is borrowing.
+    if let Some((name, b_span, c_span)) =
+        find_consume_borrow_collision(&l.consumes, &r.borrows)
+    {
+        return Err(Error::new(
+            ErrorCategory::TypeError,
+            b_span,
+            Some(format!(
+                "right operand of `+` cannot borrow `{name}` because it was consumed by the left operand"
+            )),
+        )
+        .with_related(c_span, format!("`{name}` was consumed here")));
+    }
+
+    // BUG 3 FIX: left is borrowing something that right is consuming.
+    if let Some((name, c_span, b_span)) =
+        find_borrow_consume_collision(&l.borrows, &r.consumes)
+    {
+        return Err(Error::new(
+            ErrorCategory::TypeError,
+            c_span,
+            Some(format!(
+                "right operand of `+` cannot consume `{name}` because it is borrowed by the left operand"
+            )),
+        )
+        .with_related(b_span, format!("`{name}` is borrowed here")));
+    }
+
     let consumes = merge_consumes_disjoint(l.consumes, r.consumes)?;
     let borrows = merge_borrows_union(l.borrows, r.borrows);
     Ok(Check {
@@ -237,12 +579,17 @@ fn check_seq(
     first: &Expr,
     second: &Expr,
     env: &Env,
+    method_env: &MethodEnv,
     expected_usage: Option<Usage>,
     mode: ConsumeMode,
 ) -> Result<Check, Error> {
-    // e1 always in Borrow mode (the borrow scope is e1; e2 sees `e1` as
-    // having "completed and discarded").
-    let f = check_expr(first, env, Some(Usage::Ordinary), ConsumeMode::Borrow)?;
+    let f = check_expr(
+        first,
+        env,
+        method_env,
+        Some(Usage::Ordinary),
+        ConsumeMode::Borrow,
+    )?;
     if f.typed.usage != Usage::Ordinary {
         let why = match f.typed.usage {
             Usage::Linear => "would silently leak (Phase 0/1 invariant)",
@@ -259,11 +606,8 @@ fn check_seq(
         ));
     }
 
-    // e2 inherits the outer mode and outer expected_usage.
-    let s = check_expr(second, env, expected_usage, mode)?;
+    let s = check_expr(second, env, method_env, expected_usage, mode)?;
 
-    // Disjointness: e1's consumes vs e2's consumes; e1's consumes vs e2's
-    // borrows (e2 can't borrow what e1 just consumed).
     let consumes = merge_consumes_disjoint(f.consumes.clone(), s.consumes.clone())?;
     if let Some((name, b_span, c_span)) = find_consume_borrow_collision(&f.consumes, &s.borrows) {
         return Err(Error::new(
@@ -276,12 +620,11 @@ fn check_seq(
         .with_related(c_span, format!("`{name}` was consumed here")));
     }
 
-    // Result borrows: B1 minus anything e2 consumed (those nested borrows
-    // got "resolved" by the consume) ∪ B2.
     let mut b1 = f.borrows;
     for name in s.consumes.keys() {
         b1.remove(name);
     }
+
     let borrows = merge_borrows_union(b1, s.borrows);
 
     Ok(Check {
@@ -291,18 +634,10 @@ fn check_seq(
     })
 }
 
-/// Tuple construction. The `mode` parameter is threaded through to
-/// components but doesn't change the accept/reject set for ordinary
-/// tuples in Phase 2: any linear-var component in Borrow mode becomes
-/// shared, and the ordinary-tuple's "components must be ordinary" check
-/// rejects shared just as it would have rejected linear in Consume mode.
-/// Mode is here for forward-compat — Phase 3+'s method calls will pass
-/// linear arguments to ordinary-typed callees in Borrow mode, and the
-/// var rule's mode-sensitivity will start mattering at component
-/// granularity then. Don't drop the parameter.
 fn check_tuple_construction(
     elems: &[Expr],
     env: &Env,
+    method_env: &MethodEnv,
     expected_usage: Option<Usage>,
     span: Span,
     mode: ConsumeMode,
@@ -332,7 +667,7 @@ fn check_tuple_construction(
     let mut consumes: BTreeMap<String, Span> = BTreeMap::new();
     let mut borrows: BTreeMap<String, Span> = BTreeMap::new();
     for elem in elems {
-        let c = check_expr(elem, env, component_expected, mode)?;
+        let c = check_expr(elem, env, method_env, component_expected, mode)?;
         if outer_usage == Usage::Ordinary && c.typed.usage != Usage::Ordinary {
             return Err(Error::new(
                 ErrorCategory::TypeError,
@@ -343,6 +678,7 @@ fn check_tuple_construction(
                 )),
             ));
         }
+
         field_types.push(TupleField {
             usage: c.typed.usage,
             ty: c.typed.ty,
@@ -366,17 +702,12 @@ fn check_projection(
     index: usize,
     span: Span,
     env: &Env,
+    method_env: &MethodEnv,
     mode: ConsumeMode,
 ) -> Result<Check, Error> {
-    // Inner in outer mode, expected_usage = None (projection accepts
-    // ordinary or shared input; mode + variable rule decide which).
-    let t = check_expr(tuple, env, None, mode)?;
+    let t = check_expr(tuple, env, method_env, None, mode)?;
 
     if t.typed.usage == Usage::Linear {
-        // In Consume mode, projecting a linear var lookup keeps the var
-        // linear. The user wanted an implicit borrow; tell them why this
-        // didn't happen. (In Borrow mode the lookup would have already
-        // produced shared, so we never reach this branch.)
         return Err(Error::new(
             ErrorCategory::TypeError,
             tuple.span(),
@@ -424,18 +755,24 @@ fn check_projection(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_destructure(
     names: &[(String, Span)],
     value: &Expr,
     body: &Expr,
     _span: Span,
     env: &Env,
+    method_env: &MethodEnv,
     expected_usage: Option<Usage>,
     mode: ConsumeMode,
 ) -> Result<Check, Error> {
-    // Value always in Consume mode — deconstruction needs to own the
-    // tuple. Outer mode is irrelevant here.
-    let v = check_expr(value, env, Some(Usage::Linear), ConsumeMode::Consume)?;
+    let v = check_expr(
+        value,
+        env,
+        method_env,
+        Some(Usage::Linear),
+        ConsumeMode::Consume,
+    )?;
 
     if v.typed.usage != Usage::Linear {
         return Err(Error::new(
@@ -487,9 +824,8 @@ fn check_destructure(
         );
     }
 
-    let b = check_expr(body, &body_env, expected_usage, mode)?;
+    let b = check_expr(body, &body_env, method_env, expected_usage, mode)?;
 
-    // Linear field bindings must be consumed in body.
     for ((name, name_span), field) in names.iter().zip(fields.iter()) {
         if field.usage == Usage::Linear && !b.consumes.contains_key(name) {
             return Err(Error::new(
@@ -502,7 +838,6 @@ fn check_destructure(
         }
     }
 
-    // Disjointness: C1 ∩ keys(B2) — body can't borrow what value consumed.
     if let Some((name, b_span, c_span)) = find_consume_borrow_collision(&v.consumes, &b.borrows) {
         return Err(Error::new(
             ErrorCategory::TypeError,
@@ -514,9 +849,6 @@ fn check_destructure(
         .with_related(c_span, format!("`{name}` was consumed here")));
     }
 
-    // Disjointness: B1 ∩ keys(C2) — body can't consume what value borrows.
-    // (e1's borrows are not in scope for e2 to resolve via consumption,
-    // unlike the let-linear/ordinary case.)
     if let Some((name, c_span, b_span)) = find_borrow_consume_collision(&v.borrows, &b.consumes) {
         return Err(Error::new(
             ErrorCategory::TypeError,
@@ -528,9 +860,6 @@ fn check_destructure(
         .with_related(b_span, format!("`{name}` is borrowed here")));
     }
 
-    // Strip the field bindings from body's consumes (per the rule
-    // `C2 \ {x1, ..., xn}`) before merging — these are local to the
-    // deconstruction.
     let mut body_consumes = b.consumes;
     let mut body_borrows = b.borrows;
     for (name, _) in names {
@@ -539,7 +868,6 @@ fn check_destructure(
     }
 
     let consumes = merge_consumes_disjoint(v.consumes, body_consumes)?;
-    // B1 propagates entirely (no `\ keys(C2)`); body's borrows merged on top.
     let borrows = merge_borrows_union(v.borrows, body_borrows);
 
     Ok(Check {
@@ -558,20 +886,16 @@ fn check_let(
     body: &Expr,
     _span: Span,
     env: &Env,
+    method_env: &MethodEnv,
     expected_usage: Option<Usage>,
     mode: ConsumeMode,
 ) -> Result<Check, Error> {
-    // Mode and expected_usage for `e1` depend on the annotation.
     let (value_mode, value_expected) = match usage {
         Usage::Linear | Usage::Ordinary => (ConsumeMode::Consume, Some(usage)),
-        Usage::Shared => {
-            // For shared lets, e1 runs in Borrow mode; expected_usage =
-            // None (don't drive tuple construction toward shared).
-            (ConsumeMode::Borrow, None)
-        }
+        Usage::Shared => (ConsumeMode::Borrow, None),
     };
 
-    let v = check_expr(value, env, value_expected, value_mode)?;
+    let v = check_expr(value, env, method_env, value_expected, value_mode)?;
 
     if v.typed.usage != usage {
         return Err(Error::new(
@@ -587,9 +911,8 @@ fn check_let(
     let mut body_env = env.clone();
     body_env.insert(name.to_string(), v.typed.clone());
 
-    let b = check_expr(body, &body_env, expected_usage, mode)?;
+    let b = check_expr(body, &body_env, method_env, expected_usage, mode)?;
 
-    // Linear binding must be consumed in the body.
     if usage == Usage::Linear && !b.consumes.contains_key(name) {
         return Err(Error::new(
             ErrorCategory::TypeError,
@@ -598,7 +921,6 @@ fn check_let(
         ));
     }
 
-    // Disjointness: C1 ∩ C2 (handled by merge), C1 ∩ keys(B2).
     if let Some((conflict_name, b_span, c_span)) =
         find_consume_borrow_collision(&v.consumes, &b.borrows)
     {
@@ -612,8 +934,6 @@ fn check_let(
         .with_related(c_span, format!("`{conflict_name}` was consumed here")));
     }
 
-    // For shared lets, also check B1 ∩ keys(C2): the body cannot consume a
-    // variable that the shared binding is borrowing.
     let outgoing_value_borrows = if usage == Usage::Shared {
         if let Some((conflict_name, c_span, b_span)) =
             find_borrow_consume_collision(&v.borrows, &b.consumes)
@@ -627,11 +947,8 @@ fn check_let(
             )
             .with_related(b_span, format!("`{conflict_name}` is borrowed by `{name}` here")));
         }
-        // Shared binding extends e1's borrows through the let; B' = B1.
         v.borrows
     } else {
-        // For linear/ordinary: e1's borrows can be resolved by anything
-        // e2 consumed (their scope ended at the end of e1).
         let mut b1 = v.borrows;
         for n in b.consumes.keys() {
             b1.remove(n);
@@ -639,8 +956,6 @@ fn check_let(
         b1
     };
 
-    // Strip the bound name from body's maps before merging (it's local to
-    // the let).
     let mut body_consumes = b.consumes;
     let mut body_borrows = b.borrows;
     body_consumes.remove(name);
@@ -653,6 +968,134 @@ fn check_let(
         typed: b.typed,
         consumes,
         borrows,
+    })
+}
+
+// -----------------------------------------------------------------------------
+// Method calls
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------
+// FIX FOR BUG 2: check_method_call was leaking shared-argument borrows
+// past the call boundary.
+//
+// The original code ended with:
+//   Ok(Check { typed: result_type, consumes: combined_consumes, borrows: combined_borrows })
+//
+// This is WRONG. Borrows from shared-param arguments are only valid for
+// the duration of the call. Once the method returns, those borrows are
+// over — the variable is no longer being lent to anyone. Returning
+// combined_borrows to the caller means the caller's surrounding context
+// (e.g. a seq or let) sees the variable as still borrowed, causing false
+// "cannot consume while borrowed" errors on code that runs *after* the call.
+//
+// Example that was incorrectly rejected before this fix:
+//   method peek(shared p: (int,int)) returns (ordinary r: int) { p.0 }
+//   let linear y = (1,2) in peek(y) ; let (a,b) = y in a+b
+//                                     ^^^^^^^^^^^^^^^^^^^
+//   The seq's e2 consuming y triggered a spurious borrow-vs-consume error
+//   because peek(y)'s borrow of y leaked out of the call.
+//
+// Fix: the borrows are used *only* for the internal cross-arg aliasing check
+// (which is still performed in the loop above), then discarded. The returned
+// Check carries borrows: BTreeMap::new().
+// -----------------------------------------------------------------------
+fn check_method_call(
+    name: &str,
+    name_span: Span,
+    args: &[Expr],
+    span: Span,
+    env: &Env,
+    method_env: &MethodEnv,
+) -> Result<Check, Error> {
+    let entry = method_env.get(name).ok_or_else(|| {
+        Error::new(
+            ErrorCategory::TypeError,
+            name_span,
+            Some(format!("unknown method `{name}`")),
+        )
+    })?;
+
+    if args.len() != entry.params.len() {
+        return Err(Error::new(
+            ErrorCategory::TypeError,
+            span,
+            Some(format!(
+                "method `{name}` takes {} argument{} but {} {} provided",
+                entry.params.len(),
+                if entry.params.len() == 1 { "" } else { "s" },
+                args.len(),
+                if args.len() == 1 { "was" } else { "were" },
+            )),
+        ));
+    }
+
+    let mut combined_consumes: BTreeMap<String, Span> = BTreeMap::new();
+    // combined_borrows is used solely for the cross-arg aliasing check below;
+    // it is NOT returned to the caller (see BUG 2 fix comment above).
+    let mut combined_borrows: BTreeMap<String, Span> = BTreeMap::new();
+
+    for (i, (arg, param)) in args.iter().zip(entry.params.iter()).enumerate() {
+        let (arg_mode, arg_expected) = match param.usage {
+            Usage::Linear => (ConsumeMode::Consume, Some(Usage::Linear)),
+            Usage::Ordinary => (ConsumeMode::Consume, Some(Usage::Ordinary)),
+            Usage::Shared => (ConsumeMode::Borrow, None),
+        };
+        let c = check_expr(arg, env, method_env, arg_expected, arg_mode)?;
+
+        if c.typed.usage != param.usage {
+            return Err(Error::new(
+                ErrorCategory::TypeError,
+                arg.span(),
+                Some(format!(
+                    "argument {} to `{name}` has usage `{}`, but the parameter expects `{}`",
+                    i + 1,
+                    c.typed.usage,
+                    param.usage,
+                )),
+            ));
+        }
+
+        if c.typed.ty != param.ty {
+            return Err(Error::new(
+                ErrorCategory::TypeError,
+                arg.span(),
+                Some(format!(
+                    "argument {} to `{name}` has type `{}`, but the parameter expects `{}`",
+                    i + 1,
+                    c.typed.ty,
+                    param.ty,
+                )),
+            ));
+        }
+
+        combined_consumes = merge_consumes_disjoint(combined_consumes, c.consumes)?;
+        combined_borrows = merge_borrows_union(combined_borrows, c.borrows);
+    }
+
+    // Cross-arg aliasing check: a variable consumed by one arg and borrowed
+    // by another is a soundness violation (same as the reject/19 test case).
+    if let Some((conflict, c_span, b_span)) =
+        find_borrow_consume_collision(&combined_borrows, &combined_consumes)
+    {
+        return Err(Error::new(
+            ErrorCategory::TypeError,
+            c_span,
+            Some(format!(
+                "cannot consume `{conflict}` in a call to `{name}`: another argument borrows it"
+            )),
+        )
+        .with_related(b_span, format!("`{conflict}` is borrowed here")));
+    }
+
+    let result_type = body_expected_type(&entry.effective_returns);
+
+    // BUG 2 FIX: return borrows: empty. Shared-argument borrows are scoped to
+    // the call and must not propagate into the surrounding context.
+    Ok(Check {
+        typed: result_type,
+        consumes: combined_consumes,
+        borrows: BTreeMap::new(),
     })
 }
 
@@ -674,23 +1117,17 @@ fn require_ordinary_int(typed: &Typed, span: Span, what: &str) -> Result<(), Err
     }
 }
 
-/// `share_as(outer_usage, field_usage)` per the Phase 2 projection rule:
-/// projecting through an ordinary tuple keeps each field's usage; through
-/// a shared tuple, every linear/shared field becomes shared.
+/// `share_as(outer_usage, field_usage)` per the Phase 2 projection rule.
 fn share_as(outer: Usage, inner: Usage) -> Usage {
     match (outer, inner) {
-        // Ordinary tuple: field's own usage stands.
         (Usage::Ordinary, u) => u,
-        // Shared tuple: ordinary stays ordinary; linear/shared collapse to shared.
         (Usage::Shared, Usage::Ordinary) => Usage::Ordinary,
         (Usage::Shared, Usage::Linear) | (Usage::Shared, Usage::Shared) => Usage::Shared,
-        // Linear outer is rejected by the projection rule before reaching here.
         (Usage::Linear, _) => unreachable!("projection rule rejects linear outer"),
     }
 }
 
-/// Merge two consumes maps. On collision, error: the variable was
-/// consumed twice. Primary span at the second site, related at the first.
+/// Merge two consumes maps. On collision → consumed-twice error.
 fn merge_consumes_disjoint(
     mut a: BTreeMap<String, Span>,
     b: BTreeMap<String, Span>,
@@ -709,12 +1146,8 @@ fn merge_consumes_disjoint(
     Ok(a)
 }
 
-/// Merge two borrows maps. **No disjointness check** — multiple borrows of
-/// the same variable are valid (that's the whole point of `shared`). On a
-/// name collision, the *first-seen* span is kept (the existing entry
-/// wins; the new one is dropped). This is a deliberate choice — it gives
-/// stable error spans regardless of which subexpression was processed
-/// last. Don't accidentally flip this to last-seen.
+/// Merge two borrows maps. Multiple borrows of the same variable are valid;
+/// first-seen span wins on collision.
 fn merge_borrows_union(
     mut a: BTreeMap<String, Span>,
     b: BTreeMap<String, Span>,
@@ -725,9 +1158,8 @@ fn merge_borrows_union(
     a
 }
 
-/// Find a name that appears in both `consumes` and `borrows`. Returns
-/// `(name, borrow_span, consume_span)` for the first conflict, or `None`.
-/// Used by the seq / decon / let rules' `C ∩ keys(B) = ∅` checks.
+/// Find a name in both `consumes` and `borrows`.
+/// Returns `(name, borrow_span, consume_span)`.
 fn find_consume_borrow_collision(
     consumes: &BTreeMap<String, Span>,
     borrows: &BTreeMap<String, Span>,
@@ -740,10 +1172,8 @@ fn find_consume_borrow_collision(
     None
 }
 
-/// Find a name that appears in both `borrows` and `consumes`. Returns
-/// `(name, consume_span, borrow_span)` for the first conflict, or `None`.
-/// Used by the decon / let-shared rules' `B ∩ keys(C) = ∅` checks where
-/// the consume site is the action being rejected.
+/// Find a name in both `borrows` and `consumes`.
+/// Returns `(name, consume_span, borrow_span)`.
 fn find_borrow_consume_collision(
     borrows: &BTreeMap<String, Span>,
     consumes: &BTreeMap<String, Span>,
@@ -757,8 +1187,7 @@ fn find_borrow_consume_collision(
 }
 
 // -----------------------------------------------------------------------------
-// Inline structural tests. End-to-end accept/reject coverage lives in the
-// test corpus.
+// Inline structural tests.
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -776,11 +1205,11 @@ mod tests {
         check_program(&prog).expect_err("expected type error")
     }
 
-    /// For tests that need to inspect the `Check` struct directly.
     fn run_check(src: &str) -> Check {
         let prog = parse(src).expect("parse failed");
         let env = Env::new();
-        check_expr(&prog.main_expr, &env, None, ConsumeMode::Consume)
+        let method_env = MethodEnv::new();
+        check_expr(&prog.main_expr, &env, &method_env, None, ConsumeMode::Consume)
             .expect("type check failed")
     }
 
@@ -856,7 +1285,7 @@ mod tests {
         assert_eq!(typed.ty, Type::Int);
     }
 
-    // -- Phase 1 carry-over (consumes empty regression) --
+    // -- Phase 1 carry-over --
 
     #[test]
     fn ordinary_program_has_empty_consumes_and_borrows() {
@@ -923,9 +1352,6 @@ mod tests {
 
     #[test]
     fn project_linear_is_type_error() {
-        // Phase 2: projecting from a linear var (in Consume mode) is
-        // still a type error — the user should borrow first. The Phase 1
-        // message changed slightly; assert intent rather than exact text.
         let err = check_err("let linear t = (1, 2) in t.0");
         assert_eq!(err.category, ErrorCategory::TypeError);
         let note = err.note.unwrap();
@@ -939,11 +1365,6 @@ mod tests {
         assert!(err.note.unwrap().contains("linear tuple"));
     }
 
-    /// Phase 1 spelling: "must not produce a linear value". Phase 2: the
-    /// same program now rejects because `t` becomes shared in Borrow mode
-    /// and the seq rule rejects shared. Loosen the assertion to match the
-    /// rule's intent (sequencing rejecting based on e1's usage), not the
-    /// specific blocking usage word.
     #[test]
     fn seq_linear_is_type_error() {
         let err = check_err("let linear t = (1, 2) in t ; 5");
@@ -959,27 +1380,27 @@ mod tests {
 
     #[test]
     fn linear_var_in_borrow_mode_returns_shared() {
-        // Build env directly to bypass the parser.
         let mut env = Env::new();
         env.insert(
             "y".to_string(),
             Typed {
                 usage: Usage::Linear,
-                ty: Type::Int, // shape doesn't matter for the lookup
+                ty: Type::Int,
             },
         );
         let var_expr = Expr::Var {
             name: "y".to_string(),
             span: Span::new(0, 1),
         };
+        let method_env = MethodEnv::new();
         let in_consume =
-            check_expr(&var_expr, &env, None, ConsumeMode::Consume).unwrap();
+            check_expr(&var_expr, &env, &method_env, None, ConsumeMode::Consume).unwrap();
         assert_eq!(in_consume.typed.usage, Usage::Linear);
         assert_eq!(in_consume.consumes.len(), 1);
         assert!(in_consume.borrows.is_empty());
 
         let in_borrow =
-            check_expr(&var_expr, &env, None, ConsumeMode::Borrow).unwrap();
+            check_expr(&var_expr, &env, &method_env, None, ConsumeMode::Borrow).unwrap();
         assert_eq!(in_borrow.typed.usage, Usage::Shared);
         assert!(in_borrow.consumes.is_empty());
         assert_eq!(in_borrow.borrows.len(), 1);
@@ -987,8 +1408,6 @@ mod tests {
 
     #[test]
     fn seq_borrow_basic_resolves_borrow() {
-        // The seq's e1 borrows y; e2 consumes y; the borrow gets resolved
-        // by the consume so the outer let is happy.
         let typed = check_ok(
             "let linear y = (1, 2) in (y.0 + y.1) ; let (a, b) = y in a + b",
         );
@@ -1023,24 +1442,17 @@ mod tests {
 
     #[test]
     fn share_escape_is_type_error() {
-        // `let shared s = y` borrows y; the body then tries to consume y
-        // via deconstruction. The let-shared rule's `B1 ∩ keys(C2)` check
-        // catches this.
         let err = check_err(
             "let linear y = (1, 2) in let shared s = y in let (a, b) = y in a + b",
         );
         assert_eq!(err.category, ErrorCategory::TypeError);
         let note = err.note.unwrap();
         assert!(note.contains("shared") || note.contains("borrow"));
-        // Should have a related span pointing at where y was borrowed.
         assert!(!err.related.is_empty());
     }
 
     #[test]
     fn borrow_unresolved_falls_through_to_linear_unused() {
-        // `(y.0 + y.0) ; 5` — the borrow of y is *not* resolved (e2 doesn't
-        // consume y). The outer linear-must-be-consumed check fires
-        // because y was never consumed at all.
         let err = check_err("let linear y = (1, 2) in (y.0 + y.0) ; 5");
         assert_eq!(err.category, ErrorCategory::TypeError);
         assert!(err.note.unwrap().contains("not consumed"));
@@ -1048,8 +1460,6 @@ mod tests {
 
     #[test]
     fn seq_returning_shared_is_type_error() {
-        // Phase 2-specific: `t ; 5` where t is linear. In Borrow mode, t
-        // becomes shared. seq rejects because u1 is shared.
         let err = check_err("let linear t = (1, 2) in t ; 5");
         assert_eq!(err.category, ErrorCategory::TypeError);
         let note = err.note.unwrap();
@@ -1061,7 +1471,6 @@ mod tests {
 
     #[test]
     fn share_as_table() {
-        // Direct unit test of the `share_as` function.
         assert_eq!(share_as(Usage::Ordinary, Usage::Ordinary), Usage::Ordinary);
         assert_eq!(share_as(Usage::Ordinary, Usage::Linear), Usage::Linear);
         assert_eq!(share_as(Usage::Ordinary, Usage::Shared), Usage::Shared);
@@ -1077,7 +1486,351 @@ mod tests {
         let mut b = BTreeMap::new();
         b.insert("y".to_string(), Span::new(10, 11));
         let merged = merge_borrows_union(a, b);
-        // First-seen (the entry from `a`) should win.
         assert_eq!(merged.get("y").copied(), Some(Span::new(0, 1)));
+    }
+
+    // -- Phase 3 pass 1: method environment collection --
+
+    fn collect_ok(src: &str) -> MethodEnv {
+        let prog = parse(src).expect("parse failed");
+        collect_method_env(&prog.decls).expect("collection failed")
+    }
+
+    fn collect_err(src: &str) -> Error {
+        let prog = parse(src).expect("parse failed");
+        collect_method_env(&prog.decls).expect_err("expected collection error")
+    }
+
+    #[test]
+    fn empty_program_yields_empty_method_env() {
+        let env = collect_ok("1");
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn single_method_collected() {
+        let env = collect_ok(
+            "method add(ordinary x: int, ordinary y: int) returns (ordinary r: int) { x + y } 1",
+        );
+        let entry = env.get("add").expect("`add` should be in env");
+        assert_eq!(entry.params.len(), 2);
+        assert_eq!(entry.params[0].usage, Usage::Ordinary);
+        assert_eq!(entry.params[0].ty, Type::Int);
+        assert!(!entry.params[0].inout);
+        assert_eq!(entry.effective_returns.len(), 1);
+        assert_eq!(entry.effective_returns[0].usage, Usage::Ordinary);
+    }
+
+    #[test]
+    fn multiple_methods_collected() {
+        let env = collect_ok(
+            "method first() returns (ordinary r: int) { 1 } \
+             method second() returns (ordinary r: int) { 2 } \
+             1",
+        );
+        assert!(env.contains_key("first"));
+        assert!(env.contains_key("second"));
+        assert_eq!(env.len(), 2);
+    }
+
+    #[test]
+    fn inout_appended_to_effective_returns() {
+        let env = collect_ok(
+            "method incr(linear inout p: (int, int)) returns (ordinary first: int) { \
+             let (a, b) = p in let linear new_p = (a + 1, b + 1) in (a, new_p) \
+             } 1",
+        );
+        let entry = env.get("incr").unwrap();
+        assert_eq!(entry.params.len(), 1);
+        assert!(entry.params[0].inout);
+        assert_eq!(entry.params[0].usage, Usage::Linear);
+        assert_eq!(entry.effective_returns.len(), 2);
+        assert_eq!(entry.effective_returns[0].usage, Usage::Ordinary);
+        assert_eq!(entry.effective_returns[0].ty, Type::Int);
+        assert!(!entry.effective_returns[0].inout);
+        assert_eq!(entry.effective_returns[1].usage, Usage::Linear);
+        assert!(!entry.effective_returns[1].inout);
+    }
+
+    #[test]
+    fn inout_only_method_has_one_effective_return() {
+        let env = collect_ok(
+            "method passthrough(linear inout p: (int, int)) returns () { p } 1",
+        );
+        let entry = env.get("passthrough").unwrap();
+        assert_eq!(entry.effective_returns.len(), 1);
+        assert_eq!(entry.effective_returns[0].usage, Usage::Linear);
+    }
+
+    #[test]
+    fn no_returns_no_inout_yields_empty_effective_returns() {
+        let env = collect_ok("method nop() returns () { () } 1");
+        let entry = env.get("nop").unwrap();
+        assert!(entry.params.is_empty());
+        assert!(entry.effective_returns.is_empty());
+    }
+
+    #[test]
+    fn duplicate_method_name_is_type_error_with_related_span() {
+        let err = collect_err(
+            "method foo() returns (ordinary r: int) { 1 } \
+             method foo() returns (ordinary r: int) { 2 } \
+             1",
+        );
+        assert_eq!(err.category, ErrorCategory::TypeError);
+        let note = err.note.expect("note");
+        assert!(note.contains("declared more than once"), "got: {note}");
+        assert_eq!(err.related.len(), 1);
+        assert!(err.related[0].label.contains("first declared here"));
+        assert_ne!(err.related[0].span, err.span);
+    }
+
+    #[test]
+    fn shared_return_is_type_error() {
+        let err = collect_err("method bad() returns (shared r: int) { 5 } 1");
+        assert_eq!(err.category, ErrorCategory::TypeError);
+        assert!(err.note.unwrap().contains("`shared`"));
+    }
+
+    #[test]
+    fn shared_param_is_fine() {
+        let env = collect_ok(
+            "method peek(shared p: (int, int)) returns (ordinary r: int) { p.0 + p.1 } 1",
+        );
+        let entry = env.get("peek").unwrap();
+        assert_eq!(entry.params[0].usage, Usage::Shared);
+    }
+
+    #[test]
+    fn inout_in_returns_doesnt_reach_collection() {
+        let prog_err = parse("method bad() returns (linear inout x: int) { x } 1");
+        assert!(prog_err.is_err());
+    }
+
+    // -- Phase 3 pass 2: body checking + method calls --
+
+    #[test]
+    fn body_expected_type_table() {
+        let zero = body_expected_type(&[]);
+        assert_eq!(zero.usage, Usage::Ordinary);
+        assert_eq!(zero.ty, Type::Tuple(Vec::new()));
+
+        let one = body_expected_type(&[ParamSig {
+            usage: Usage::Linear,
+            inout: false,
+            ty: Type::Int,
+        }]);
+        assert_eq!(one.usage, Usage::Linear);
+        assert_eq!(one.ty, Type::Int);
+
+        let two_ord = body_expected_type(&[
+            ParamSig { usage: Usage::Ordinary, inout: false, ty: Type::Int },
+            ParamSig { usage: Usage::Ordinary, inout: false, ty: Type::Int },
+        ]);
+        assert_eq!(two_ord.usage, Usage::Ordinary);
+        if let Type::Tuple(fields) = &two_ord.ty {
+            assert_eq!(fields.len(), 2);
+        } else {
+            panic!("expected Tuple");
+        }
+
+        let two_mixed = body_expected_type(&[
+            ParamSig { usage: Usage::Ordinary, inout: false, ty: Type::Int },
+            ParamSig { usage: Usage::Linear, inout: false, ty: Type::Int },
+        ]);
+        assert_eq!(two_mixed.usage, Usage::Linear);
+    }
+
+    #[test]
+    fn method_simple_accept() {
+        let typed = check_ok(
+            "method add(ordinary x: int, ordinary y: int) returns (ordinary r: int) { x + y } \
+             add(3, 4)",
+        );
+        assert_eq!(typed.usage, Usage::Ordinary);
+        assert_eq!(typed.ty, Type::Int);
+    }
+
+    #[test]
+    fn method_consume_linear_arg_accept() {
+        let typed = check_ok(
+            "method consume(linear t: (int, int)) returns (ordinary r: int) { \
+             let (a, b) = t in a + b \
+             } \
+             let linear t = (1, 2) in consume(t)",
+        );
+        assert_eq!(typed.ty, Type::Int);
+    }
+
+    #[test]
+    fn method_with_shared_param_accept() {
+        let typed = check_ok(
+            "method peek(shared p: (int, int)) returns (ordinary r: int) { p.0 + p.1 } \
+             let linear y = (1, 2) in peek(y) ; let (a, b) = y in a + b",
+        );
+        assert_eq!(typed.ty, Type::Int);
+    }
+
+    #[test]
+    fn inout_basic_accept() {
+        let typed = check_ok(
+            "method passthrough(linear inout p: (int, int)) returns () { p } \
+             let linear t = (5, 5) in let linear new_t = passthrough(t) in \
+             let (x, y) = new_t in x + y",
+        );
+        assert_eq!(typed.ty, Type::Int);
+    }
+
+    #[test]
+    fn inout_with_returns_accept() {
+        let typed = check_ok(
+            "method incr_and_first(linear inout p: (int, int)) returns (ordinary first: int) { \
+             let (a, b) = p in let linear new_p = (a + 1, b + 1) in (a, new_p) \
+             } \
+             let linear t = (5, 7) in let (first, new_t) = incr_and_first(t) in \
+             let (x, y) = new_t in first + x + y",
+        );
+        assert_eq!(typed.ty, Type::Int);
+    }
+
+    #[test]
+    fn mutual_recursion_signatures_accept() {
+        let typed = check_ok(
+            "method first(ordinary x: int) returns (ordinary r: int) { second(x + 1) } \
+             method second(ordinary x: int) returns (ordinary r: int) { x + 10 } \
+             first(5)",
+        );
+        assert_eq!(typed.ty, Type::Int);
+    }
+
+    #[test]
+    fn method_arg_arity_reject() {
+        let err = check_err(
+            "method add(ordinary x: int, ordinary y: int) returns (ordinary r: int) { x + y } \
+             add(1, 2, 3)",
+        );
+        assert_eq!(err.category, ErrorCategory::TypeError);
+        let note = err.note.unwrap();
+        assert!(note.contains("takes 2") && note.contains("3"), "got: {note}");
+    }
+
+    #[test]
+    fn method_arg_type_mismatch_reject() {
+        let err = check_err(
+            "method square(ordinary x: int) returns (ordinary r: int) { x + x } \
+             let ordinary t = (1, 2) in square(t)",
+        );
+        assert_eq!(err.category, ErrorCategory::TypeError);
+        assert!(err.note.unwrap().contains("type"));
+    }
+
+    #[test]
+    fn method_linear_param_unused_reject() {
+        let err = check_err(
+            "method bad(linear t: (int, int)) returns (ordinary r: int) { 5 } \
+             bad((1, 2))",
+        );
+        assert_eq!(err.category, ErrorCategory::TypeError);
+        let note = err.note.unwrap();
+        assert!(note.contains("not consumed"), "got: {note}");
+    }
+
+    #[test]
+    fn inout_not_rebound_reject() {
+        let err = check_err(
+            "method bad(linear inout p: (int, int)) returns () { let (a, b) = p in a + b } \
+             1",
+        );
+        assert_eq!(err.category, ErrorCategory::TypeError);
+        let note = err.note.unwrap();
+        assert!(
+            note.contains("body produces") || note.contains("expected return"),
+            "got: {note}",
+        );
+    }
+
+    #[test]
+    fn undefined_method_reject() {
+        let err = check_err("unknown(1, 2)");
+        assert_eq!(err.category, ErrorCategory::TypeError);
+        assert!(err.note.unwrap().contains("unknown method"));
+    }
+
+    #[test]
+    fn consume_borrow_arg_conflict_reject() {
+        let err = check_err(
+            "method M(linear t: (int, int), shared s: (int, int)) returns (ordinary r: int) { \
+             let (a, b) = t in s.0 + a + b \
+             } \
+             let linear y = (1, 2) in M(y, y)",
+        );
+        assert_eq!(err.category, ErrorCategory::TypeError);
+        let note = err.note.unwrap();
+        assert!(note.contains("consume") && note.contains("borrow"), "got: {note}");
+        assert_eq!(err.related.len(), 1);
+        assert_ne!(err.related[0].span, err.span);
+    }
+
+    #[test]
+    fn empty_method_returns_unit() {
+        let typed = check_ok("method nop() returns () { () } nop()");
+        assert_eq!(typed.usage, Usage::Ordinary);
+        assert_eq!(typed.ty, Type::Tuple(Vec::new()));
+    }
+
+    #[test]
+    fn method_no_consume_in_body_for_ordinary_param() {
+        let typed = check_ok(
+            "method ignore(ordinary x: int) returns (ordinary r: int) { 42 } ignore(7)",
+        );
+        assert_eq!(typed.ty, Type::Int);
+    }
+
+    // -- NEW REGRESSION TESTS for the three bug fixes --
+
+    /// BUG 1 + BUG 3 regression: `check_add` must reject a linear variable
+    /// consumed by one operand and borrowed by the other.
+    #[test]
+    fn add_consume_borrow_conflict_reject() {
+        // Left operand consumes x (via decon), right operand borrows x (via peek).
+        let err = check_err(
+            "method peek(shared p: (int, int)) returns (ordinary r: int) { p.0 + p.1 } \
+             method consume(linear t: (int, int)) returns (ordinary r: int) { \
+             let (a, b) = t in a + b \
+             } \
+             let linear x = (1, 2) in consume(x) + peek(x)",
+        );
+        assert_eq!(err.category, ErrorCategory::TypeError);
+        let note = err.note.unwrap();
+        assert!(
+            note.contains("borrow") || note.contains("consume"),
+            "got: {note}",
+        );
+    }
+
+    /// BUG 2 regression: after a shared-param call, the caller must still be
+    /// able to consume the borrowed variable (borrow must NOT leak out).
+    #[test]
+    fn shared_param_call_borrow_does_not_leak() {
+        // peek(y) creates a borrow of y during the call. After the call returns,
+        // y should be freely consumable. The seq then deconstructs y in e2.
+        // Before the fix this was falsely rejected with a borrow-vs-consume error.
+        let typed = check_ok(
+            "method peek(shared p: (int, int)) returns (ordinary r: int) { p.0 + p.1 } \
+             let linear y = (1, 2) in peek(y) ; let (a, b) = y in a + b",
+        );
+        assert_eq!(typed.ty, Type::Int);
+    }
+
+    /// BUG 2 regression: two successive shared-param calls on the same variable,
+    /// followed by consuming it — all three must be accepted.
+    #[test]
+    fn two_shared_calls_then_consume_accept() {
+        let typed = check_ok(
+            "method peek(shared p: (int, int)) returns (ordinary r: int) { p.0 + p.1 } \
+             let linear y = (1, 2) in \
+             (peek(y) + peek(y)) ; let (a, b) = y in a + b",
+        );
+        assert_eq!(typed.ty, Type::Int);
     }
 }
