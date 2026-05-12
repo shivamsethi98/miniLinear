@@ -1,0 +1,7 @@
+// EXPECT: type error — y is both borrowed (shared) and consumed
+// BUG: implementation PASSES this
+//The let ordinary z wrapping the shared binding causes the borrow of y to be silently resolved by the outer consume, bypassing the B1 ∩ keys(C2) guard that the paper's typing rule requires.
+
+let linear y = (1, 2) in
+  let ordinary z = (let shared s = y in s.0 + s.1) in
+    z + (let (a, b) = y in a + b)-
