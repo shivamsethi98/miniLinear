@@ -1,0 +1,4 @@
+let linear t = (1, 2) in
+let ordinary x = t in x.0;
+let (a,b) = t in
+a+b

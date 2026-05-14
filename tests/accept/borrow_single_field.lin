@@ -1,3 +1,0 @@
-let linear t = (1, 2) in 
- let ordinary z = t.0 in 
-    let (a, b) = t in a + b + z
