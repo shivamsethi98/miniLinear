@@ -1,0 +1,4 @@
+method consume(linear t: (int, int)) returns (ordinary r: int) {
+  let (a, b) = t in a + b
+}
+let linear t = (1, 2) in consume(t)
